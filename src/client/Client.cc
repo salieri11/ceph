@@ -601,6 +601,7 @@ void Client::_pre_init()
 
   objecter_finisher.start();
   filer.reset(new Filer(objecter, &objecter_finisher));
+  fscrypt.reset(new FSCrypt());
 
   objectcacher->start();
 }
