@@ -11267,14 +11267,16 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
                              &fscrypt_denc);
 
   // read (and possibly block)
+  //
   int r = 0;
   if (onfinish == nullptr) {
     io_finish_cond = new C_SaferCond("Client::_read_async flock");
     io_finish.reset(io_finish_cond);
   }
 
-  r = objectcacher->file_read(&in->oset, &in->layout, in->snapid,
-			      read_start, read_len, bl, 0, io_finish.get());
+  std::vector<ObjectCacher::ObjHole> holes;
+  r = objectcacher->file_read_ex(&in->oset, &in->layout, in->snapid,
+                                 read_start, read_len, bl, 0, &holes, io_finish.get());
  
   if (onfinish != nullptr) {
     // Release C_Read_Async_Finisher from managed pointer, either
@@ -11303,11 +11305,14 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
   if (r >= 0) {
     auto len = r;
     if (fscrypt_denc) {
-      r = fscrypt_denc->decrypt_bl(off, target_len, read_start, bl);
+      r = fscrypt_denc->decrypt_bl(off, target_len, read_start, holes, bl);
       if (r < 0) {
         ldout(cct, 20) << __func__ << "(): failed to decrypt buffer: r=" << r << dendl;
+        return r;
       }
     }
+
+    r = bl->length();
 
     update_read_io_size(bl->length());
   }
@@ -11402,6 +11407,7 @@ int Client::_read_sync(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
     bufferlist tbl;
 
     int wanted = left;
+#warning read holes
     filer->read_trunc(in->ino, &in->layout, in->snapid,
 		      pos, left, &tbl, 0,
 		      in->truncate_size, in->truncate_seq,
@@ -11418,7 +11424,8 @@ int Client::_read_sync(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
 
   if (r >= 0) {
     if (fscrypt_denc) {
-      r = fscrypt_denc->decrypt_bl(off, target_len, read_start, pbl);
+      std::vector<ObjectCacher::ObjHole> holes;
+      r = fscrypt_denc->decrypt_bl(off, target_len, read_start, holes, pbl);
       if (r < 0) {
         ldout(cct, 20) << __func__ << "(): failed to decrypt buffer: r=" << r << dendl;
       }
