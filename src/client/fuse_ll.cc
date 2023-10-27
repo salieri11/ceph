@@ -1020,6 +1020,7 @@ static void fuse_ll_ioctl(fuse_req_t req, fuse_ino_t ino,
     }
     break;
     case FS_IOC_REMOVE_ENCRYPTION_KEY: {
+  generic_dout(0) << __FILE__ << ":" << "[" << cmd << "]" << __LINE__ << dendl;
       if (!in_buf
           || in_bufsz < sizeof(fscrypt_remove_key_arg)) {
         fuse_reply_err(req, EFAULT);

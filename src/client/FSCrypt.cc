@@ -378,6 +378,7 @@ FSCryptKeyRef& FSCryptKeyHandler::get_key()
 
 int FSCryptKeyStore::create(const char *k, int klen, FSCryptKeyHandlerRef& key_handler)
 {
+  ldout(cct, 10) << __FILE__ << ":" << __LINE__ << dendl;
   auto key = std::make_shared<FSCryptKey>();
 
   int r = key->init(k, klen);
@@ -407,6 +408,7 @@ int FSCryptKeyStore::create(const char *k, int klen, FSCryptKeyHandlerRef& key_h
 
 int FSCryptKeyStore::_find(const struct ceph_fscrypt_key_identifier& id, FSCryptKeyHandlerRef& kh)
 {
+  ldout(cct, 10) << __FILE__ << ":" << __LINE__ << dendl;
   auto iter = m.find(id);
   if (iter == m.end()) {
     return -ENOENT;
@@ -419,6 +421,7 @@ int FSCryptKeyStore::_find(const struct ceph_fscrypt_key_identifier& id, FSCrypt
 
 int FSCryptKeyStore::find(const struct ceph_fscrypt_key_identifier& id, FSCryptKeyHandlerRef& kh)
 {
+  ldout(cct, 10) << __FILE__ << ":" << __LINE__ << dendl;
   std::shared_lock rl{lock};
 
   return _find(id, kh);
@@ -426,6 +429,7 @@ int FSCryptKeyStore::find(const struct ceph_fscrypt_key_identifier& id, FSCryptK
 
 int FSCryptKeyStore::invalidate(const struct ceph_fscrypt_key_identifier& id)
 {
+  ldout(cct, 10) << __FILE__ << ":" << __LINE__ << dendl;
   std::unique_lock rl{lock};
 
   FSCryptKeyHandlerRef kh;
@@ -454,6 +458,7 @@ FSCryptDenc::FSCryptDenc(CephContext *_cct) : cct(_cct), cipher_ctx(EVP_CIPHER_C
 
 void FSCryptDenc::init_cipher(EVP_CIPHER *_cipher, std::vector<OSSL_PARAM> params)
 {
+  ldout(cct, 10) << __FILE__ << ":" << __LINE__ << dendl;
   cipher = _cipher;
   cipher_params = std::move(params);
 }
@@ -486,6 +491,7 @@ static std::map<int, fscrypt_cipher_opt> cipher_opt_map = {
 
 bool FSCryptDenc::do_setup_cipher(int enc_mode)
 {
+  ldout(cct, 10) << __FILE__ << ":" << __LINE__ << dendl;
   auto iter = cipher_opt_map.find(enc_mode);
   if (iter == cipher_opt_map.end()) {
     return false;

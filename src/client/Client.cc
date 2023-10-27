@@ -17861,6 +17861,7 @@ void Client::set_uuid(const std::string& uuid)
 int Client::add_fscrypt_key(const char *key_data, int key_len,
                             ceph_fscrypt_key_identifier *kid)
 {
+  ldout(cct, 10) << __func__ << "key_data:=" << " key_length:=" << key_len << dendl;
   auto& key_store = fscrypt->get_key_store();
 
   FSCryptKeyHandlerRef kh;
