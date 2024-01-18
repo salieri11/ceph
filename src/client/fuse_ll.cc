@@ -936,6 +936,7 @@ static void fuse_ll_ioctl(fuse_req_t req, fuse_ino_t ino,
   CephFuse::Handle *cfuse = fuse_ll_req_prepare(req);
   const struct fuse_ctx *ctx = fuse_req_ctx(req);
 
+      generic_dout(0) << __FILE__ << ":" << __LINE__ << ": 11here arg=" << (void *)_arg << " in_buf=" << (void *)in_buf << dendl;
   if (flags & FUSE_IOCTL_COMPAT) {
     fuse_reply_err(req, ENOSYS);
     return;
@@ -1001,7 +1002,7 @@ static void fuse_ll_ioctl(fuse_req_t req, fuse_ino_t ino,
       generic_dout(0) << __FILE__ << ":" << __LINE__ << ": raw_size=" << arg->raw_size << " key_id=" << arg->key_id << dendl;
       generic_dout(0) << __FILE__ << ":" << __LINE__ << ": raw:\n" << fscrypt_hex_str(arg->raw, arg->raw_size) << dendl;
 
-      if (arg->key_id == 0 &&
+     if (arg->key_id == 0 &&
           in_bufsz < sizeof(*arg) + arg->raw_size) {
         generic_dout(0) << __FILE__ << ":" << __LINE__ << ": in_bufsz=" << in_bufsz << " too short, expected=" << sizeof(*arg) + arg->raw_size << dendl;
         fuse_reply_err(req, ERANGE);
@@ -1009,14 +1010,16 @@ static void fuse_ll_ioctl(fuse_req_t req, fuse_ino_t ino,
       }
 
       const struct fuse_ctx *ctx = fuse_req_ctx(req);
-      int r = cfuse->client->add_fscrypt_key((const char *)arg->raw, arg->raw_size, nullptr, ctx->uid);
+      ceph_fscrypt_key_identifier kid;
+      int r = cfuse->client->add_fscrypt_key((const char *)arg->raw, arg->raw_size, &kid, ctx->uid);
       if (r < 0) {
         generic_dout(0) << __FILE__ << ":" << __LINE__ << ": failed to create a new key: r=" << r << dendl;
         fuse_reply_err(req, -r);
         break;
       }
 
-      fuse_reply_ioctl(req, 0, nullptr, 0);
+      memcpy(&arg->key_spec.u.identifier, &kid.raw, 16);
+      fuse_reply_ioctl(req, 0, arg, sizeof(*arg));
       break;
     }
     break;
