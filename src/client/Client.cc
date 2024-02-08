@@ -3680,6 +3680,7 @@ void Client::get_cap_ref(Inode *in, int cap)
 
 void Client::put_cap_ref(Inode *in, int cap)
 {
+  ldout(cct, 10) << __func__ << " cap=" << cap << " " << *in << dendl;
   int last = in->put_cap_ref(cap);
   if (last) {
     int put_nref = 0;
@@ -4523,6 +4524,7 @@ void Client::_flushed(Inode *in)
 {
   ldout(cct, 10) << "_flushed " << *in << dendl;
 
+	ldout(cct, 10) << "aaherem" <<dendl;
   put_cap_ref(in, CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_BUFFER);
 }
 
@@ -10591,6 +10593,7 @@ int Client::_open(Inode *in, int flags, mode_t mode, Fh **fhp,
       req->head.args.open.mask = DEBUG_GETATTR_CAPS;
     else
       req->head.args.open.mask = 0;
+    ldout(cct, 10) << "_open size=" << in->size << dendl;
     req->head.args.open.old_size = in->size;   // for O_TRUNC
     req->set_inode(in);
     result = make_request(req, perms);
@@ -10619,6 +10622,7 @@ int Client::_open(Inode *in, int flags, mode_t mode, Fh **fhp,
 			  " . Denying open: " <<
 			  cpp_strerror(result) << dendl;
       } else {
+	ldout(cct, 10) << "aahere1" <<dendl;
 	put_cap_ref(in, need);
       }
     }
@@ -10947,6 +10951,7 @@ void Client::C_Read_Finisher::finish_io(int r)
   iofinished = true;
 
   if (have_caps) {
+//	lgeneric_subdout(clnt->cct, clnt, 20) << "aahere2" <<dendl;
     clnt->put_cap_ref(in, CEPH_CAP_FILE_RD);
   }
 
@@ -10964,6 +10969,9 @@ void Client::C_Read_Sync_NonBlocking::retry()
                     in->truncate_size, in->truncate_seq, this);
 }
 
+void Client::print(std::string * c){
+  ldout(cct,10) << c << dendl;
+}
 /**
  * The following method implements most of what _read_sync does, but in a
  * way that works with the non-blocking read path.
@@ -11006,6 +11014,7 @@ void Client::C_Read_Sync_NonBlocking::finish(int r)
         goto success;
     }
 
+//	clnt->print("aahere3");
     clnt->put_cap_ref(in, CEPH_CAP_FILE_RD);
     // reverify size
     {
@@ -11206,6 +11215,7 @@ retry:
       offset += rc;
       size -= rc;
 
+	ldout(cct, 10) << "aahere4" <<dendl;
       put_cap_ref(in, CEPH_CAP_FILE_RD);
       have = 0;
       // reverify size
@@ -11240,6 +11250,7 @@ success:
 done:
   // done!
   if (have) {
+	ldout(cct, 10) << "aahere5" <<dendl;
     put_cap_ref(in, CEPH_CAP_FILE_RD);
   }
   if (movepos) {
@@ -11261,6 +11272,7 @@ Client::C_Readahead::~C_Readahead() {
 
 void Client::C_Readahead::finish(int r) {
   lgeneric_subdout(client->cct, client, 20) << "client." << client->get_nodeid() << " " << "C_Readahead on " << f->inode << dendl;
+//	client->print("aahere6");
   client->put_cap_ref(f->inode.get(), CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
   if (r > 0) {
     client->update_read_io_size(r);
@@ -11400,6 +11412,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
     r = io_finish_cond->wait();
 
     client_lock.lock();
+	ldout(cct, 10) << "aahere7" <<dendl;
     put_cap_ref(in, CEPH_CAP_FILE_CACHE);
   }
 
@@ -11695,6 +11708,7 @@ void Client::C_Write_Finisher::finish_io(int r)
 {
   bool fini;
 
+//	clnt->print("aahere8");
   clnt->put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
   if (r >= 0) {
@@ -11761,6 +11775,7 @@ bool Client::C_Write_Finisher::try_complete()
     state->advance();
   } else if (onuninlinefinished && iofinished) {
     // Now we are REALLY done...
+//	clnt->print("aahere9");
     clnt->put_cap_ref(in, CEPH_CAP_FILE_WR);
 
     if (fsync_r < 0) {
@@ -11855,7 +11870,10 @@ int Client::WriteEncMgr::read_modify_write(Context *_iofinish)
   end_block = fscrypt_block_from_ofs(endoff - 1);
   end_block_ofs = fscrypt_block_start(endoff - 1);
   ofs_in_end_block = fscrypt_ofs_in_block(endoff - 1);
-
+  ldout(cct, 10) << "start_block=" << start_block << " start_block_ofs=" << start_block_ofs
+		 << " ofs_in_start_block=" << ofs_in_start_block << " end_block=" << end_block
+		 << " end_block_ofs=" << end_block_ofs << " ofs_in_end_block=" << ofs_in_end_block
+		 << dendl;
   need_read_start = ofs_in_start_block > 0;
   need_read_end = (endoff < in->effective_size() && ofs_in_end_block < FSCRYPT_BLOCK_SIZE - 1 && start_block != end_block);
 
@@ -11863,6 +11881,8 @@ int Client::WriteEncMgr::read_modify_write(Context *_iofinish)
                      FSCRYPT_BLOCK_SIZE : ofs_in_start_block);
   
   bool need_read = need_read_start | need_read_start;
+  ldout(cct, 10) << "need_read_start=" << need_read_start << "need_read_end=" << need_read_end
+                 << " read_start_size=" << read_start_size << " need_read=" << need_read << dendl;
 
 
   if (read_start_size > 0) {
@@ -11895,11 +11915,15 @@ int Client::WriteEncMgr::read_modify_write(Context *_iofinish)
     clnt->client_lock.unlock();
 
     if (finish_read_start_ctx) {
+      ldout(cct, 10) << "aahere waiting for start beg" << dendl;
       finish_read_start_ctx->wait();
+      ldout(cct, 10) << "aahere waiting for start end" << dendl;
     }
 
     if (finish_read_end_ctx) {
+      ldout(cct, 10) << "aahere waiting for end beg" << dendl;
       finish_read_end_ctx->wait();
+      ldout(cct, 10) << "aahere waiting for end end" << dendl;
     }
 
     clnt->client_lock.lock();
@@ -11968,7 +11992,7 @@ void Client::WriteEncMgr::finish_read_start(int r)
 void Client::WriteEncMgr::finish_read_end(int r)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
-
+  ldout(cct, 10) << "finish_read_end: endbl=" << endbl.length() << " blsize=" << bl.length() << dendl;
   if (r >= 0) {
     std::lock_guard l{lock};
     if (endbl.length() > ofs_in_end_block) {
@@ -11986,11 +12010,14 @@ bool Client::WriteEncMgr::do_try_finish(int r)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
 
+      ldout(cct, 0) << "aaherea1" << dendl;
   if (!aioc.is_complete()) {
     return false;
   }
+      ldout(cct, 0) << "aaherea2" << dendl;
 
   if (r >= 0) {
+      ldout(cct, 0) << "aahere3" << dendl;
     offset = start_block_ofs;
 
     pbl = &encbl;
@@ -12002,6 +12029,8 @@ bool Client::WriteEncMgr::do_try_finish(int r)
     size = encbl.length();
   }
 
+      ldout(cct, 0) << "aaherea offset=" << offset << " size=" << size << " blsize=" << bl.length() << dendl;
+//	clnt->print("aaherea");
   clnt->put_cap_ref(in, CEPH_CAP_FILE_RD);
   in->mark_caps_dirty(CEPH_CAP_FILE_RD);
 
@@ -12139,18 +12168,28 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
   }
 
   int want, have;
-  if (f->mode & CEPH_FILE_MODE_LAZY)
+  if (f->mode & CEPH_FILE_MODE_LAZY) {
     want = CEPH_CAP_FILE_BUFFER | CEPH_CAP_FILE_LAZYIO;
-  else
-    want = CEPH_CAP_FILE_BUFFER;
+  } else {
+	ldout(cct, 10) << "aahere WANT filebuffer" <<dendl;
+    want = CEPH_CAP_FILE_BUFFER; 
+  }
+    int have3 = get_caps_used(in);
+    if (have3 & (CEPH_CAP_FILE_BUFFER))
+	ldout(cct, 10) << "aahere filebuffer BEFORE" <<dendl;
   int r = get_caps(f, CEPH_CAP_FILE_WR|CEPH_CAP_AUTH_SHARED, want, &have, endoff);
+    have3 = get_caps_used(in);
+    if (have3 & (CEPH_CAP_FILE_BUFFER))
+	ldout(cct, 10) << "aaherehas filebuffer" <<dendl;
   if (r < 0)
     return r;
 
+	ldout(cct, 10) << "aahereb" <<dendl;
   put_cap_ref(in, CEPH_CAP_AUTH_SHARED);
   if (size > 0) {
     r = clear_suid_sgid(in, f->actor_perms);
     if (r < 0) {
+	ldout(cct, 10) << "aaherec" <<dendl;
       put_cap_ref(in, CEPH_CAP_FILE_WR);
       return r;
     }
@@ -12166,10 +12205,12 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
   ceph::ref_t<WriteEncMgr> enc_mgr;
 
   if (buffered_write) {
+	ldout(cct, 10) << "aahereww" <<dendl;
     enc_mgr = ceph::make_ref<WriteEncMgr_Buffered>(this, f,
                                            offset, size, bl,
                                            !!onfinish);
   } else {
+	ldout(cct, 10) << "aaherexx" <<dendl;
     enc_mgr = ceph::make_ref<WriteEncMgr_NotBuffered>(this, f,
                                            offset, size, bl,
                                            !!onfinish);
@@ -12179,6 +12220,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
   r = enc_mgr->init();
   if (r < 0) {
     ldout(cct, 0) << __func__ << "(): enc_mgr init failed (r=" << r << ")" << dendl;
+	ldout(cct, 10) << "aahered" <<dendl;
     put_cap_ref(in, CEPH_CAP_FILE_WR);
     return r;
   }
@@ -12192,9 +12234,11 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
     if (endoff > cct->_conf->client_max_inline_size ||
         endoff > CEPH_INLINE_MAX_SIZE ||
         !(have & CEPH_CAP_FILE_BUFFER)) {
+      ldout(cct, 10) << "aahere_endoff" << dendl;
       onuninline.reset(new C_SaferCond("Client::_write_uninline_data flock"));
       uninline_data(in, onuninline.get());
     } else {
+	ldout(cct, 10) << "aahereyy" <<dendl;
       get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
       uint32_t len = in->inline_data.length();
@@ -12210,6 +12254,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
       in->inline_data.append(bl);
       in->inline_version++;
 
+	ldout(cct, 10) << "aahereeeeeE" <<dendl;
       put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
       goto success;
@@ -12217,6 +12262,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
   }
 
   if (onfinish) {
+	ldout(cct, 10) << "aahere onfinish" <<dendl;
      cwf_iofinish = new CWF_iofinish();
      iofinish.reset(cwf_iofinish);
 
@@ -12238,14 +12284,18 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
 
     // do buffered write
 
+	ldout(cct, 10) << "aaherelll" <<dendl;
     r = enc_mgr->read_modify_write(iofinish.get());
+	ldout(cct, 10) << "aaherelll" <<dendl;
     if (r < 0) {
       ldout(cct, 0) << __func__ << "(): enc_mgr read failed (r=" << r << ")" << dendl;
+	ldout(cct, 10) << "aaheref" <<dendl;
       put_cap_ref(in, CEPH_CAP_FILE_WR);
       return r;
     }
 
     if (onfinish) {
+	ldout(cct, 10) << "aaherezz" <<dendl;
       // handle non-blocking caller (onfinish != nullptr), we can now safely
       // release all the managed pointers, but we might need to do something
       // with iofinisher.
@@ -12276,8 +12326,13 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
       return 0;
     }
 
+	ldout(cct, 10) << "aahereg" <<dendl;
+//  get_caps(f, CEPH_CAP_FILE_WR|CEPH_CAP_AUTH_SHARED, want, &have, endoff);
+    int have2 = get_caps_used(in);
+    if (have2 & (CEPH_CAP_FILE_BUFFER)){
+	ldout(cct, 10) << "aahereyeah" <<dendl;
+    }
     put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
-
     if (r < 0)
       goto done;
 
@@ -12314,6 +12369,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
     client_lock.unlock();
     r = cond_iofinish->wait();
     client_lock.lock();
+	ldout(cct, 10) << "aahereh" <<dendl;
     put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
     if (r < 0)
       goto done;
@@ -12352,6 +12408,7 @@ done:
       r = uninline_ret;
   }
 
+	ldout(cct, 10) << "aaherei" <<dendl;
   put_cap_ref(in, CEPH_CAP_FILE_WR);
   return r;
 }
@@ -12372,6 +12429,7 @@ int Client::_flush(Fh *f)
 
 int Client::truncate(const char *relpath, loff_t length, const UserPerm& perms) 
 {
+  ldout(cct, 10) << __func__ << "truncate size:=" << length << dendl;
   struct ceph_statx stx;
   stx.stx_size = length;
   return setattrx(relpath, &stx, CEPH_SETATTR_SIZE, perms);
@@ -16904,6 +16962,7 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
 
   r = clear_suid_sgid(in, fh->actor_perms);
   if (r < 0) {
+	ldout(cct, 10) << "aaherej" <<dendl;
     put_cap_ref(in, CEPH_CAP_FILE_WR);
     return r;
   }
@@ -16956,6 +17015,7 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
       client_lock.unlock();
       onfinish.wait();
       client_lock.lock();
+	ldout(cct, 10) << "aaherek" <<dendl;
       put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
     }
   } else if (!(mode & FALLOC_FL_KEEP_SIZE)) {
@@ -16988,6 +17048,7 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
       r = ret;
   }
 
+	ldout(cct, 10) << "aaherel" <<dendl;
   put_cap_ref(in, CEPH_CAP_FILE_WR);
   return r;
 }

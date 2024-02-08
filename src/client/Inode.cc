@@ -192,6 +192,7 @@ void Inode::get_cap_ref(int cap)
     if (cap & 1) {
       int c = 1 << n;
       cap_refs[c]++;
+      lderr(client->cct) << "get_cap_ref c=" << (c) << " cap_ref=" << cap_refs[c] << dendl;
       //cout << "inode " << *this << " get " << cap_string(c) << " " << (cap_refs[c]-1) << " -> " << cap_refs[c] << std::endl;
     }
     cap >>= 1;
@@ -207,11 +208,12 @@ int Inode::put_cap_ref(int cap)
     if (cap & 1) {
       int c = 1 << n;
       if (cap_refs[c] <= 0) {
-	lderr(client->cct) << "put_cap_ref " << ccap_string(c) << " went negative on " << *this << dendl;
+	lderr(client->cct) << "put_cap_ref c=" << (c) << " " << ccap_string(c) << " went negative on " << *this << dendl;
 	ceph_assert(cap_refs[c] > 0);
       }
       if (--cap_refs[c] == 0)
         last |= c;
+      lderr(client->cct) << "put_cap_ref c=" << (c) << " cap_ref=" << cap_refs[c] << dendl;
       //cout << "inode " << *this << " put " << cap_string(c) << " " << (cap_refs[c]+1) << " -> " << cap_refs[c] << std::endl;
     }
     cap >>= 1;
