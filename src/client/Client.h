@@ -266,6 +266,7 @@ public:
 
   typedef int (*add_dirent_cb_t)(void *p, struct dirent *de, struct ceph_statx *stx, off_t off, Inode *in);
 
+void print(std::string* c);
   struct walk_dentry_result {
     InodeRef in;
     std::string alternate_name;
