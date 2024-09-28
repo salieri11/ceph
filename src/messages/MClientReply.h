@@ -329,6 +329,7 @@ public:
   ceph::buffer::list trace_bl;
   ceph::buffer::list extra_bl;
   ceph::buffer::list snapbl;
+  struct errorcode32_t error_code;
 
   int get_op() const { return head.op; }
 
@@ -346,11 +347,15 @@ public:
     // other platforms.
     return head.result;
     #else
-    return ceph_to_hostos_errno((__s32)(__u32)head.result);
+    //return ceph_to_hostos_errno((__s32)(__u32)head.result.code);
+    return error_code.code;
     #endif
   }
 
-  void set_result(int r) { head.result = r; }
+  void set_result(int r) { //
+    //head.result = r; 
+    error_code = r;
+  }
 
   void set_unsafe() { head.safe = 0; }
 
@@ -363,8 +368,9 @@ protected:
     memset(&head, 0, sizeof(head));
     header.tid = req.get_tid();
     head.op = req.get_op();
-    head.result = result;
+    //head.result.code = result;
     head.safe = 1;
+    error_code = result;
   }
   ~MClientReply() final {}
 
@@ -393,6 +399,7 @@ public:
     decode(trace_bl, p);
     decode(extra_bl, p);
     decode(snapbl, p);
+    decode(error_code, p);
     ceph_assert(p.end());
   }
   void encode_payload(uint64_t features) override {
@@ -401,6 +408,7 @@ public:
     encode(trace_bl, payload);
     encode(extra_bl, payload);
     encode(snapbl, payload);
+    encode(error_code, payload);
   }
 
 
