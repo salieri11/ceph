@@ -368,9 +368,8 @@ protected:
     memset(&head, 0, sizeof(head));
     header.tid = req.get_tid();
     head.op = req.get_op();
-    //head.result.code = result;
     head.safe = 1;
-    error_code = result;
+    error_code = ceph_to_hostos_errno(result);
   }
   ~MClientReply() final {}
 
