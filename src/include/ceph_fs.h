@@ -807,10 +807,10 @@ copy_to_legacy_head(struct ceph_mds_request_head_legacy *legacy,
 	*legacy = *embedded_legacy;
 }
 
+
 /* client reply */
 struct ceph_mds_reply_head {
 	__le32 op;
-	//__le32 result;
 	__le32 mdsmap_epoch;
 	__u8 safe;                     /* true if committed to disk */
 	__u8 is_dentry, is_target;     /* true if dentry, target inode records

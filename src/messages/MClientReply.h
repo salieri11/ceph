@@ -337,23 +337,13 @@ public:
   epoch_t get_mdsmap_epoch() const { return head.mdsmap_epoch; }
 
   int get_result() const {
-    #ifdef _WIN32
-    // libclient and libcephfs return CEPHFS_E* errors, which are basically
-    // Linux errno codes. If we convert mds errors to host errno values, we
-    // end up mixing error codes.
-    //
-    // For Windows, we'll preserve the original error value, which is expected
-    // to be a linux (CEPHFS_E*) error. It may be worth doing the same for
-    // other platforms.
-    return head.result;
-    #else
-    //return ceph_to_hostos_errno((__s32)(__u32)head.result.code);
-    return error_code.code;
-    #endif
+    // MDS now uses host errors, as defined in errno.cc, for current platform.
+    // errorcode32_t is converting, internally, the error code from host to ceph, when encoding, and vice versa,
+    // when decoding, resulting having LINUX codes on the wire, and HOST code on the receiver.
+    return error_code;
   }
 
   void set_result(int r) { //
-    //head.result = r; 
     error_code = r;
   }
 
@@ -369,7 +359,10 @@ protected:
     header.tid = req.get_tid();
     head.op = req.get_op();
     head.safe = 1;
-    error_code = ceph_to_hostos_errno(result);
+    // MDS now uses host errors, as defined in errno.cc, for current platform.
+    // errorcode32_t is converting, internally, the error code from host to ceph, when encoding, and vice versa,
+    // when decoding, resulting having LINUX codes on the wire, and HOST code on the receiver.
+    error_code = result;
   }
   ~MClientReply() final {}
 
