@@ -105,7 +105,7 @@ TEST(LibCephFS, OpenReadTruncate) {
 
   fd = ceph_open(cmount, path.c_str(), O_RDONLY, 0);
   ASSERT_LE(0, fd);
-  ASSERT_EQ(ceph_ftruncate(cmount, fd, 0), -CEPHFS_EBADF);
+  ASSERT_EQ(ceph_ftruncate(cmount, fd, 0), -EBADF);
   ASSERT_EQ(ceph_ftruncate(cmount, fd, 1), -CEPHFS_EBADF);
   ASSERT_EQ(0, ceph_close(cmount, fd));
 

@@ -118,7 +118,7 @@ TEST(LibCephFS, BasicRecordLocking) {
   lock2.l_start = 0;
   lock2.l_len = 1024;
   lock2.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock2, 43, false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock2, 43, false));
 
   // Now try a conflicting read lock
   lock2.l_type = F_RDLCK;
@@ -126,7 +126,7 @@ TEST(LibCephFS, BasicRecordLocking) {
   lock2.l_start = 100;
   lock2.l_len = 100;
   lock2.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock2, 43, false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock2, 43, false));
 
   // Now do a getlk
   ASSERT_EQ(0, ceph_ll_getlk(cmount, fh, &lock2, 43));
@@ -313,7 +313,7 @@ static void thread_ConcurrentRecordLocking(str_ConcurrentRecordLocking& s) {
   lock1.l_start = 0;
   lock1.l_len = 1024;
   lock1.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
 
   PING_MAIN(1); // (1)
   lock1.l_type = F_WRLCK;
@@ -443,7 +443,7 @@ TEST(LibCephFS, ConcurrentRecordLocking) {
   lock1.l_start = 0;
   lock1.l_len = 1024;
   lock1.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
   lock1.l_type = F_RDLCK;
   lock1.l_whence = SEEK_SET;
   lock1.l_start = 0;
@@ -485,13 +485,13 @@ TEST(LibCephFS, ConcurrentRecordLocking) {
   lock1.l_start = 0;
   lock1.l_len = 1024;
   lock1.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
   lock1.l_type = F_RDLCK;
   lock1.l_whence = SEEK_SET;
   lock1.l_start = 0;
   lock1.l_len = 1024;
   lock1.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
 
   // Wake up thread to unlock exclusive lock
   PING_WORKER(3); // (R3)
@@ -587,7 +587,7 @@ TEST(LibCephFS, ThreesomeRecordLocking) {
   lock1.l_start = 0;
   lock1.l_len = 1024;
   lock1.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
   lock1.l_type = F_RDLCK;
   lock1.l_whence = SEEK_SET;
   lock1.l_start = 0;
@@ -629,13 +629,13 @@ TEST(LibCephFS, ThreesomeRecordLocking) {
 	lock1.l_start = 0;
 	lock1.l_len = 1024;
 	lock1.l_pid = getpid();
-	ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
+	ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
 	lock1.l_type = F_RDLCK;
 	lock1.l_whence = SEEK_SET;
 	lock1.l_start = 0;
 	lock1.l_len = 1024;
 	lock1.l_pid = getpid();
-	ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
+	ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
 	
 	// Wake up thread to unlock exclusive lock
 	PING_WORKER(3); // (R3)
@@ -706,7 +706,7 @@ static void process_ConcurrentRecordLocking(str_ConcurrentRecordLocking& s) {
   lock1.l_start = 0;
   lock1.l_len = 1024;
   lock1.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, mypid, false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, mypid, false));
   PING_MAIN(1); // (1)
   lock1.l_type = F_WRLCK;
   lock1.l_whence = SEEK_SET;
