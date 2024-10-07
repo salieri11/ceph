@@ -848,7 +848,7 @@ TEST(LibCephFS, DISABLED_InterProcessRecordLocking) {
   lock1.l_start = 0;
   lock1.l_len = 1024;
   lock1.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, mypid, false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, mypid, false));
   lock1.l_type = F_RDLCK;
   lock1.l_whence = SEEK_SET;
   lock1.l_start = 0;
@@ -890,13 +890,13 @@ TEST(LibCephFS, DISABLED_InterProcessRecordLocking) {
   lock1.l_start = 0;
   lock1.l_len = 1024;
   lock1.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, mypid, false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, mypid, false));
   lock1.l_type = F_RDLCK;
   lock1.l_whence = SEEK_SET;
   lock1.l_start = 0;
   lock1.l_len = 1024;
   lock1.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, mypid, false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, mypid, false));
 
   // Wake up process to unlock exclusive lock
   PING_WORKER(4); // (R4)
@@ -1019,7 +1019,7 @@ TEST(LibCephFS, DISABLED_ThreesomeInterProcessRecordLocking) {
   lock1.l_start = 0;
   lock1.l_len = 1024;
   lock1.l_pid = getpid();
-  ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, mypid, false));
+  ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, mypid, false));
   lock1.l_type = F_RDLCK;
   lock1.l_whence = SEEK_SET;
   lock1.l_start = 0;
@@ -1061,13 +1061,13 @@ TEST(LibCephFS, DISABLED_ThreesomeInterProcessRecordLocking) {
 	lock1.l_start = 0;
 	lock1.l_len = 1024;
 	lock1.l_pid = getpid();
-	ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
+	ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
 	lock1.l_type = F_RDLCK;
 	lock1.l_whence = SEEK_SET;
 	lock1.l_start = 0;
 	lock1.l_len = 1024;
 	lock1.l_pid = getpid();
-	ASSERT_EQ(-CEPHFS_EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
+	ASSERT_EQ(-EAGAIN, ceph_ll_setlk(cmount, fh, &lock1, ceph_pthread_self(), false));
 	
 	// Wake up process to unlock exclusive lock
 	PING_WORKER(4); // (R4)
