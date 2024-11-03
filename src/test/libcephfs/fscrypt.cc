@@ -894,7 +894,7 @@ TEST(FSCrypt, RemoveBusyFile) {
 
 TEST(FSCrypt, RemoveBusyCreate) {
   struct ceph_fscrypt_key_identifier kid;
-
+  
   struct ceph_mount_info *cmount;
   int r = init_mount(&cmount);
   ASSERT_EQ(0, r);
@@ -949,6 +949,32 @@ TEST(FSCrypt, RemoveBusyCreate) {
 
   ceph_unlink(cmount, src_path.c_str());
   ceph_rmdir(cmount, dir_path.c_str());
+  ceph_shutdown(cmount);
+}
+
+// this test verifies that fuse client doesn't support falloate ops
+// FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_INSERT_RANGE
+// if this test fails, it means that these ops has been impleneted AND we must reject these ops for encrypted files
+// see https://www.kernel.org/doc/html/v4.18/filesystems/fscrypt.html Access Semantics section
+TEST(FSCrypt, FallocateNotImplemented) {
+  struct ceph_fscrypt_key_identifier kid;
+
+  struct ceph_mount_info* cmount;
+  int r = init_mount(&cmount);
+  ASSERT_EQ(0, r);
+
+  //file
+  string file_path = "file1";
+  int fd = ceph_open(cmount, file_path.c_str(), O_RDWR|O_CREAT|O_TRUNC, 0600);
+  int mode = FALLOC_FL_COLLAPSE_RANGE;
+  r = ceph_fallocate(cmount, fd, FALLOC_FL_COLLAPSE_RANGE, 0, 64);
+  ASSERT_EQ(-EOPNOTSUPP, r);
+  r = ceph_fallocate(cmount, fd, FALLOC_FL_ZERO_RANGE, 0, 64);
+  ASSERT_EQ(-EOPNOTSUPP, r);
+  r = ceph_fallocate(cmount, fd, FALLOC_FL_INSERT_RANGE, 0, 64);
+  ASSERT_EQ(-EOPNOTSUPP, r);
+
+  ceph_close(cmount, fd);
   ceph_shutdown(cmount);
 }
 
