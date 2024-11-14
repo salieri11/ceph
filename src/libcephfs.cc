@@ -2420,3 +2420,11 @@ extern "C" void ceph_free_snap_info_buffer(struct snap_info *snap_info) {
   }
   free(snap_info->snap_metadata);
 }
+
+extern "C" int ceph_ioctl(struct ceph_mount_info *cmount, int fd, int command, int* file_attr_out)
+{
+  if (!cmount->is_mounted())
+    return -CEPHFS_ENOTCONN;
+
+  return cmount->get_client()->handle_ioctl(fd, command, file_attr_out);
+}

@@ -178,6 +178,9 @@ struct Inode : RefCountedObject {
   uint64_t effective_size() const;
   void set_effective_size(uint64_t size);
 
+  // this methods returns true iff inode is de facto ecrypted.
+  // semantics of "enabled" is a bit confusing since it may mean 
+  // "enabled but not encrypted de facto".
   bool is_fscrypt_enabled() {
     return !!fscrypt_auth.size();
   }
@@ -193,6 +196,16 @@ struct Inode : RefCountedObject {
 
   // use i_flags as 1 << 14 will overlap with other mode bits.
   bool is_encrypted() const { return (i_flags & S_ENCRYPTED) == S_ENCRYPTED; }
+  // this function sets S_ENCRYPTED bit in i_flag
+  // is called when the is_fscrypt_enabled
+  void set_is_encrypted_flag() {
+    bool en = is_fscrypt_enabled();
+    if (en) {
+      i_flags |= S_ENCRYPTED;
+    } else {
+      i_flags &= (~S_ENCRYPTED);
+    }
+}
 
   bool has_dir_layout() const {
     return layout != file_layout_t();

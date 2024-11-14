@@ -1935,6 +1935,17 @@ int ceph_remove_fscrypt_key(struct ceph_mount_info *cmount,
 int ceph_set_fscrypt_policy_v2(struct ceph_mount_info *cmount,
                                int fd, const struct fscrypt_policy_v2 *policy);
 
+/**
+ * Quert IOCTL for file or directory. Currently only FS_IOC_GETFLAGS command
+ * supported and it sets only FS_ENCRYPT_FL in the result.
+ * @param cmount the ceph mount handle to use.
+ * @param fd open directory file descriptor
+ * @param command IOCTL command (currently FS_IOC_GETFLAGS only)
+ * @param file_attr_out will have result bits set (currently FS_ENCRYPT_FL only)
+ * @returns zero on success, other returns a negative error code.
+ */
+int ceph_ioctl(struct ceph_mount_info *cmount, int fd, int command, int* file_attr_out);
+
 /* Low Level */
 struct Inode *ceph_ll_get_inode(struct ceph_mount_info *cmount,
 				vinodeno_t vino);

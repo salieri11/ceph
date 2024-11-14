@@ -8966,6 +8966,12 @@ void Client::fill_statx(Inode *in, unsigned int mask, struct ceph_statx *stx)
     stx->stx_mask |= (CEPH_STATX_CTIME|CEPH_STATX_VERSION);
   }
 
+  // set or clear the encr attr depending on the inode status
+  if (in->is_encrypted()) {
+    stx->stx_attributes |= STATX_ATTR_ENCRYPTED;
+  } else {
+    stx->stx_attributes &= ~STATX_ATTR_ENCRYPTED;
+  }
 }
 
 void Client::touch_dn(Dentry *dn)
@@ -18352,6 +18358,35 @@ mds_rank_t Client::_get_random_up_mds() const
   return *p;
 }
 
+int Client::handle_ioctl(int fd, int command, int* file_attr_out) {
+  Fh *f = get_filehandle(fd);
+  if (!f) {
+      return -CEPHFS_EBADF;
+  }
+
+  return ll_handle_ioctl(f->inode.get(), command, file_attr_out);
+}
+
+int Client::ll_handle_ioctl(const Inode* in, int command, int* file_attr_out) {
+  if (!file_attr_out)
+      return -CEPHFS_EINVAL;
+
+  // set to 0 to make sure we support only FS_ENCRYPT_FL for now
+  *file_attr_out = 0; 
+  switch (command) {
+    case FS_IOC_GETFLAGS: {
+      // set or clear the encryption flag depending on the inode status
+      if (in->is_encrypted()) {
+          *file_attr_out |= FS_ENCRYPT_FL;
+      } else {
+          *file_attr_out &= ~FS_ENCRYPT_FL;
+      }
+      return 0;
+    }
+    default:
+      return -CEPHFS_EOPNOTSUPP;
+  }
+}
 
 StandaloneClient::StandaloneClient(Messenger *m, MonClient *mc,
 				   boost::asio::io_context& ictx)

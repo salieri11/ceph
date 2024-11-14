@@ -339,6 +339,9 @@ void print(std::string* c);
   int remove_fscrypt_key(fscrypt_remove_key_arg* kid, int user = 0);
   int get_fscrypt_key_status(fscrypt_get_key_status_arg* arg);
 
+  int handle_ioctl(int fd, int command, int* file_attr_out);
+  int ll_handle_ioctl(const Inode* in, int command, int* file_attr_out);
+
   int set_fscrypt_policy_v2(int fd, const struct fscrypt_policy_v2& policy);
 
   int mds_command(
@@ -2121,7 +2124,7 @@ private:
   void update_io_stat_metadata(utime_t latency);
   void update_io_stat_read(utime_t latency);
   void update_io_stat_write(utime_t latency);
-
+ 
   uint32_t deleg_timeout = 0;
 
   client_switch_interrupt_callback_t switch_interrupt_cb = nullptr;
