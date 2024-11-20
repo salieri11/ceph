@@ -18358,33 +18358,17 @@ mds_rank_t Client::_get_random_up_mds() const
   return *p;
 }
 
-int Client::handle_ioctl(int fd, int command, int* file_attr_out) {
-  Fh *f = get_filehandle(fd);
-  if (!f) {
-      return -CEPHFS_EBADF;
-  }
-
-  return ll_handle_ioctl(f->inode.get(), command, file_attr_out);
-}
-
-int Client::ll_handle_ioctl(const Inode* in, int command, int* file_attr_out) {
+void Client::get_inode_flags(const Inode* in, int* file_attr_out) {
   if (!file_attr_out)
       return -CEPHFS_EINVAL;
 
   // set to 0 to make sure we support only FS_ENCRYPT_FL for now
   *file_attr_out = 0; 
-  switch (command) {
-    case FS_IOC_GETFLAGS: {
-      // set or clear the encryption flag depending on the inode status
-      if (in->is_encrypted()) {
-          *file_attr_out |= FS_ENCRYPT_FL;
-      } else {
-          *file_attr_out &= ~FS_ENCRYPT_FL;
-      }
-      return 0;
-    }
-    default:
-      return -CEPHFS_EOPNOTSUPP;
+    // set or clear the encryption flag depending on the inode status
+  if (in->is_encrypted()) {
+      *file_attr_out |= FS_ENCRYPT_FL;
+  } else {
+      *file_attr_out &= ~FS_ENCRYPT_FL;
   }
 }
 

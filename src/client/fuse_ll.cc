@@ -1132,7 +1132,7 @@ static void fuse_ll_ioctl(fuse_req_t req, fuse_ino_t ino,
       }
 
       Fh *fh = (Fh*)fi->fh;
-      cfuse->client->ll_handle_ioctl(fh->inode.get(), FS_IOC_GETFLAGS, &file_attr);
+      cfuse->client->get_inode_flags(fh->inode.get(), &file_attr);
       fuse_reply_ioctl(req, 0, &file_attr, sizeof(file_attr));
 }
 break;

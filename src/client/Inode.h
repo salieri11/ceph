@@ -178,7 +178,7 @@ struct Inode : RefCountedObject {
   uint64_t effective_size() const;
   void set_effective_size(uint64_t size);
 
-  // this methods returns true iff inode is de facto ecrypted.
+  // this method returns true iff inode is de facto ecrypted.
   // semantics of "enabled" is a bit confusing since it may mean 
   // "enabled but not encrypted de facto".
   bool is_fscrypt_enabled() {
