@@ -18358,18 +18358,26 @@ mds_rank_t Client::_get_random_up_mds() const
   return *p;
 }
 
-void Client::get_inode_flags(const Inode* in, int* file_attr_out) {
+int  Client::get_inode_flags(const Inode* in, int* file_attr_out) {
   if (!file_attr_out)
       return -CEPHFS_EINVAL;
 
-  // set to 0 to make sure we support only FS_ENCRYPT_FL for now
-  *file_attr_out = 0; 
+   *file_attr_out = 0; 
     // set or clear the encryption flag depending on the inode status
   if (in->is_encrypted()) {
       *file_attr_out |= FS_ENCRYPT_FL;
   } else {
       *file_attr_out &= ~FS_ENCRYPT_FL;
   }
+  return 0;
+}
+
+int Client::get_inode_flags(int fd, int* file_attr_out) {
+  Fh *fh = get_filehandle(fd);
+  if (!fh) {
+    return -CEPHFS_EBADF;
+  }
+  return get_inode_flags(fh->inode.get(), file_attr_out);
 }
 
 StandaloneClient::StandaloneClient(Messenger *m, MonClient *mc,

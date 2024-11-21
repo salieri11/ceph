@@ -971,7 +971,7 @@ TEST(FSCrypt, QuerySEncryptFlag) {
 
   //query S_ENCRYPTED flag with ioctl on non encr directory
   int file_attr_out;
-  r = ceph_ioctl(cmount, fd, FS_IOC_GETFLAGS ,&file_attr_out);
+  r = get_inode_flags(cmount, fd, &file_attr_out);
   ASSERT_EQ(0, r);
   ASSERT_EQ(0, file_attr_out & FS_ENCRYPT_FL);
 
@@ -1006,8 +1006,7 @@ TEST(FSCrypt, QuerySEncryptFlag) {
   ASSERT_EQ(STATX_ATTR_ENCRYPTED, stx.stx_attributes & STATX_ATTR_ENCRYPTED);
 
   //query S_ENCRYPTED flag with ioctl on encrypted file
-  r = ceph_ioctl(cmount, fd1, FS_IOC_GETFLAGS ,&file_attr_out);
-  ASSERT_EQ(0, r);
+  r = get_inode_flags(cmount, fd1, &file_attr_out);
   ASSERT_EQ(FS_ENCRYPT_FL, file_attr_out & FS_ENCRYPT_FL);
 
   // cleanup
