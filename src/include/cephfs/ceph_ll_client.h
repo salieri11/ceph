@@ -135,7 +135,7 @@ struct ceph_statx {
 #define FS_ENCRYPT_FL	0x00000800 /* Encrypted file */
 #endif
 #ifndef FS_IOC_GETFLAGS
-#define FS_IOC_GETFLAGS _IOR('f', 1, unsigned long)
+#define FS_IOC_GETFLAGS _IOR('f', 1, int32_t)
 #endif
 
 /** ceph_deleg_cb_t: Delegation recalls
