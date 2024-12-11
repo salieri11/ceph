@@ -19,18 +19,13 @@ testcase=$2
 testdir=fscrypt_test_${fscrypt}_${testcase}
 mkdir $testdir
 
-XFSPROGS_DIR='xfprogs-dev-dir'
-XFSTESTS_DIR='xfstest-dev-dir'
-export XFS_IO_PROG="$(type -P xfs_io)"
+# Path to the custom fscrypt CLI
+FSCRYPT_CLI="$(type -P fscrypt)"
 
-# Setup the xfstests env
-setup_xfstests_env()
-{
-	git clone https://git.ceph.com/xfstests-dev.git $XFSTESTS_DIR --depth 1
-	pushd $XFSTESTS_DIR
-	. common/encrypt
-	popd
-}
+if [ -z "$FSCRYPT_CLI" ]; then
+    echo "fscrypt CLI not found. Ensure it is installed and in your PATH."
+    exit 1
+fi
 
 install_deps()
 {
@@ -53,40 +48,21 @@ install_deps()
 	esac
 }
 
-# Install xfsprogs-dev from source to support "add_enckey" for xfs_io
-install_xfsprogs()
-{
-	local install_xfsprogs=0
-
-	xfs_io -c "help add_enckey" | grep -q 'not found' && install_xfsprogs=1
-
-	if [ $install_xfsprogs -eq 1 ]; then
-		install_deps
-
-		git clone https://git.ceph.com/xfsprogs-dev.git $XFSPROGS_DIR --depth 1
-		pushd $XFSPROGS_DIR
-		make
-		sudo make install
-		popd
-	fi
-}
-
 clean_up()
 {
-	rm -rf $XFSPROGS_DIR
-	rm -rf $XFSTESTS_DIR
-	rm -rf $testdir
+    rm -rf $testdir
 }
 
 # For now will test the V2 encryption policy only as the
 # V1 encryption policy is deprecated
 
-install_xfsprogs
-setup_xfstests_env
+# Initialize fscrypt on the filesystem containing the test directory
+$FSCRYPT_CLI setup $testdir
 
 # Generate a fixed keying identifier
-raw_key=$(_generate_raw_encryption_key)
-keyid=$(_add_enckey $testdir "$raw_key" | awk '{print $NF}')
+key_name="test-key"
+$FSCRYPT_CLI metadata key create --name="$key_name"
+key_descriptor=$($FSCRYPT_CLI metadata key describe --name="$key_name" | awk '{print $NF}')
 
 case ${fscrypt} in
 	"none")
@@ -100,7 +76,7 @@ case ${fscrypt} in
 	"unlocked")
 		# set encrypt policy with the key provided and then
 		# the test directory will be encrypted & unlocked
-		_set_encpolicy $testdir $keyid
+		$FSCRYPT_CLI encrypt $testdir --key=$key_name
 		pushd $testdir
 		${mydir}/../suites/${testcase}.sh
 		popd
@@ -109,7 +85,7 @@ case ${fscrypt} in
 	"locked")
 		# remove the key, then the test directory will be locked
 		# and any modification will be denied by requiring the key
-		_rm_enckey $testdir $keyid
+		$FSCRYPT_CLI lock $testdir
 		clean_up
 		;;
 	*)

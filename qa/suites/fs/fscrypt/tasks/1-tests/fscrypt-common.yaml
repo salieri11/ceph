@@ -1,10 +1,30 @@
 overrides:
   install:
+    # Remove package manager installation of fscrypt
     extra_system_packages:
-      rpm:
-        - fscrypt
-      deb:
-        - fscrypt
+      rpm: []
+      deb: []
+    custom_install_commands:
+      # Update the package manager cache
+      - sudo apt-get update -y || sudo yum makecache
+
+      # Remove any pre-installed fscrypt packages
+      - sudo apt-get remove --purge -y fscrypt || sudo yum remove -y fscrypt || true
+      - sudo apt-get autoremove -y || true
+
+      # Install required dependencies for building fscrypt
+      - sudo apt-get install -y build-essential libpam0g-dev libtinfo-dev || sudo yum install -y gcc make pam-devel ncurses-devel
+
+      # Clone the custom fscrypt repository
+      - git clone https://github.com/chrisphoffman/fscrypt.git -b wip-ceph-fuse /tmp/fscrypt
+
+      # Build and install the custom fscrypt binary
+      - cd /tmp/fscrypt
+      - make
+      - sudo make install PREFIX=/usr/local
+
+      # Add the installed binary path to the PATH environment variable
+      - export PATH=/usr/local/bin:$PATH
 tasks:
   - cephfs_test_runner:
       fail_on_skip: false
