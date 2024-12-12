@@ -13,7 +13,7 @@ overrides:
       - sudo apt-get autoremove -y || true
 
       # Install required dependencies for building fscrypt
-      - sudo apt-get install -y build-essential libpam0g-dev libtinfo-dev || sudo yum install -y gcc make pam-devel ncurses-devel
+      - sudo apt-get install -y build-essential libpam0g-dev libtinfo-dev golang || sudo yum install -y gcc make pam-devel ncurses-devel golang
 
       # Clone the custom fscrypt repository
       - git clone https://github.com/chrisphoffman/fscrypt.git -b wip-ceph-fuse /tmp/fscrypt
