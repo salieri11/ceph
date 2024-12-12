@@ -35,7 +35,7 @@
 
 #include "client/FSCrypt.h"
 
-#ifd1ef __linux__
+#ifdef __linux__
 #include <limits.h>
 #include <sys/xattr.h>
 #endif
