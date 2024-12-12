@@ -18360,14 +18360,14 @@ mds_rank_t Client::_get_random_up_mds() const
 
 int  Client::get_inode_flags(const Inode* in, int* file_attr_out) {
   if (!file_attr_out)
-      return -CEPHFS_EINVAL;
+    return -CEPHFS_EINVAL;
 
-   *file_attr_out = 0; 
+  *file_attr_out = 0; 
     // set or clear the encryption flag depending on the inode status
   if (in->is_encrypted()) {
-      *file_attr_out |= FS_ENCRYPT_FL;
+    *file_attr_out |= FS_ENCRYPT_FL;
   } else {
-      *file_attr_out &= ~FS_ENCRYPT_FL;
+    *file_attr_out &= ~FS_ENCRYPT_FL;
   }
   return 0;
 }

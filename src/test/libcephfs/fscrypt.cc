@@ -35,7 +35,7 @@
 
 #include "client/FSCrypt.h"
 
-#ifdef __linux__
+#ifd1ef __linux__
 #include <limits.h>
 #include <sys/xattr.h>
 #endif
@@ -959,7 +959,7 @@ TEST(FSCrypt, QuerySEncryptFlag) {
   //add dir
   string dir_path = "sencrypt_test_dir1";
   ceph_mkdir(cmount, dir_path.c_str(), 0777);
-  int fd = ceph_open(cmount, dir_path.c_str(), O_DIRECTORY, 0);
+  int fd1 = ceph_open(cmount, dir_path.c_str(), O_DIRECTORY, 0);
 
   //query S_ENCRYPTED flag with statx on non encrypted directory
   struct ceph_statx stx;
@@ -971,7 +971,7 @@ TEST(FSCrypt, QuerySEncryptFlag) {
 
   //query S_ENCRYPTED flag with ioctl on non encr directory
   int file_attr_out;
-  r = get_inode_flags(cmount, fd, &file_attr_out);
+  r = get_inode_flags(cmount, fd1, &file_attr_out);
   ASSERT_EQ(0, r);
   ASSERT_EQ(0, file_attr_out & FS_ENCRYPT_FL);
 
@@ -984,7 +984,7 @@ TEST(FSCrypt, QuerySEncryptFlag) {
   policy.filenames_encryption_mode = FSCRYPT_MODE_AES_256_CTS;
   policy.flags = FSCRYPT_POLICY_FLAGS_PAD_32;
   memcpy(policy.master_key_identifier, kid.raw, FSCRYPT_KEY_IDENTIFIER_SIZE);
-  r = ceph_set_fscrypt_policy_v2(cmount, fd, &policy);
+  r = ceph_set_fscrypt_policy_v2(cmount, fd1, &policy);
   ASSERT_EQ(0, r);
 
   //add file to encrypted directory
@@ -993,10 +993,10 @@ TEST(FSCrypt, QuerySEncryptFlag) {
   path.append(dir_path);
   path.append("/");
   path.append(file_path);
-  int fd1 = ceph_open(cmount, path.c_str(), O_RDWR|O_CREAT|O_TRUNC, 0600);
-  r = ceph_write(cmount, fd1, fscrypt_key, sizeof(fscrypt_key), 0);
+  int fd2 = ceph_open(cmount, path.c_str(), O_RDWR|O_CREAT|O_TRUNC, 0600);
+  r = ceph_write(cmount, fd2, fscrypt_key, sizeof(fscrypt_key), 0);
   ASSERT_EQ(32, r);
-  ceph_close(cmount, fd);
+  ceph_close(cmount, fd1);
     
   //query S_ENCRYPTED flag with statx on encrypted file
   r = ceph_statx(cmount, path.c_str(), &stx,
@@ -1006,11 +1006,11 @@ TEST(FSCrypt, QuerySEncryptFlag) {
   ASSERT_EQ(STATX_ATTR_ENCRYPTED, stx.stx_attributes & STATX_ATTR_ENCRYPTED);
 
   //query S_ENCRYPTED flag with ioctl on encrypted file
-  r = get_inode_flags(cmount, fd1, &file_attr_out);
+  r = get_inode_flags(cmount, fd2, &file_attr_out);
   ASSERT_EQ(FS_ENCRYPT_FL, file_attr_out & FS_ENCRYPT_FL);
 
   // cleanup
-  ceph_close(cmount, fd1);
+  ceph_close(cmount, fd2);
   ceph_unlink(cmount, file_path.c_str());
   ceph_rmdir(cmount, dir_path.c_str());
   fscrypt_remove_key_arg arg;
