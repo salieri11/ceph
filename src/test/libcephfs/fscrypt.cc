@@ -894,7 +894,7 @@ TEST(FSCrypt, RemoveBusyFile) {
 
 TEST(FSCrypt, RemoveBusyCreate) {
   struct ceph_fscrypt_key_identifier kid;
-  
+
   struct ceph_mount_info *cmount;
   int r = init_mount(&cmount);
   ASSERT_EQ(0, r);

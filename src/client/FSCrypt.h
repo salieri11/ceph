@@ -231,7 +231,6 @@ protected:
   std::vector<char> key;
   FSCryptIV iv;
 
-  //int padding = 1;
   int key_size = 0;
   int iv_size = 0;
 
