@@ -4,7 +4,7 @@ overrides:
     extra_system_packages:
       rpm: []
       deb: []
-  tasks:
+tasks:
   - workunit:
       clients:
         all:
@@ -13,3 +13,4 @@ overrides:
       fail_on_skip: false
       modules:
         - tasks.cephfs.test_fscrypt
+ 
