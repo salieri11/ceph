@@ -8,7 +8,7 @@ tasks:
   - workunit:
       clients:
         all:
-          - fscrypt_cli_setup.sh
+          - fs/fscrypt_cli_setup.sh
   - cephfs_test_runner:
       fail_on_skip: false
       modules:
