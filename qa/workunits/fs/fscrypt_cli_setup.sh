@@ -5,6 +5,7 @@ echo "Custom fscrypt CLI setup begin"
 set -xe
 
 zgrep -h ENCRYPTION /proc/config.gz /boot/config-$(uname -r) | sort | uniq
+cat /proc/mounts
 
 # Update the package manager cache
 sudo apt-get update -y || sudo yum makecachework    
@@ -24,5 +25,6 @@ sudo make install PREFIX=/usr/local
 
 # Add the installed binary path to the PATH environment variable
 export PATH=/usr/local/bin:$PATH
+
 
 echo "Custom fscrypt CLI setup done"
