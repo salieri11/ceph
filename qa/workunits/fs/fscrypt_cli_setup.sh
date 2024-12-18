@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 
-echo "Custom fscrypt CLI setup done"
+echo "Custom fscrypt CLI setup begin"
 
 set -xe
 
+zgrep -h ENCRYPTION /proc/config.gz /boot/config-$(uname -r) | sort | uniq
+
 # Update the package manager cache
-sudo apt-get update -y || sudo yum makecache
+sudo apt-get update -y || sudo yum makecachework    
 
 # Remove any pre-installed fscrypt packages
 sudo apt-get remove --purge -y fscrypt || sudo yum remove -y fscrypt || true
