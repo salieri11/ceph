@@ -138,7 +138,7 @@ struct Inode : RefCountedObject {
   uint32_t   mode = 0;
   uid_t      uid = 0;
   gid_t      gid = 0;
-  uint32_t i_flags;
+  uint32_t   i_flags = 0;
 
   // nlink
   int32_t    nlink = 0;
@@ -203,7 +203,7 @@ struct Inode : RefCountedObject {
     // just to make sure that no garbage is set in the flag, if fscrypt is disabled
     ceph_assert(en || !(i_flags & S_ENCRYPTED));
     i_flags |= en ? S_ENCRYPTED : 0;
-}
+  }
 
   bool has_dir_layout() const {
     return layout != file_layout_t();
