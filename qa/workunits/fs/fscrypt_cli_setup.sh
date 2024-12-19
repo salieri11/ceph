@@ -8,7 +8,7 @@ zgrep -h ENCRYPTION /proc/config.gz /boot/config-$(uname -r) | sort | uniq
 cat /proc/mounts
 
 # Update the package manager cache
-sudo apt-get update -y || sudo yum makecachework    
+sudo apt-get update -y || sudo yum makecache --refresh -y
 
 # Remove any pre-installed fscrypt packages
 sudo apt-get remove --purge -y fscrypt || sudo yum remove -y fscrypt || true
