@@ -8966,12 +8966,10 @@ void Client::fill_statx(Inode *in, unsigned int mask, struct ceph_statx *stx)
     stx->stx_mask |= (CEPH_STATX_CTIME|CEPH_STATX_VERSION);
   }
 
-  // set or clear the encr attr depending on the inode status
-  if (in->is_encrypted()) {
-    stx->stx_attributes |= STATX_ATTR_ENCRYPTED;
-  } else {
-    stx->stx_attributes &= ~STATX_ATTR_ENCRYPTED;
-  }
+  // Check that the flag has no garbage, if is_encrypted() is false
+  bool en = in->is_encrypted();
+  ceph_assert(en || !(stx->stx_attributes & STATX_ATTR_ENCRYPTED));
+  stx->stx_attributes |= en ? STATX_ATTR_ENCRYPTED : 0;
 }
 
 void Client::touch_dn(Dentry *dn)
@@ -11357,7 +11355,7 @@ void Client::C_Read_Async_Finisher::finish(int r)
 int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
 			Context *onfinish)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  (ceph_mutex_is_locked_by_me(client_lock));
 
   const auto& conf = cct->_conf;
   Inode *in = f->inode.get();

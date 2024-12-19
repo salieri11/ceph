@@ -200,11 +200,9 @@ struct Inode : RefCountedObject {
   // is called when the is_fscrypt_enabled
   void set_is_encrypted_flag() {
     bool en = is_fscrypt_enabled();
-    if (en) {
-      i_flags |= S_ENCRYPTED;
-    } else {
-      i_flags &= (~S_ENCRYPTED);
-    }
+    // just to make sure that no garbage is set in the flag, if fscrypt is disabled
+    ceph_assert(en || !(i_flags & S_ENCRYPTED));
+    i_flags |= en ? S_ENCRYPTED : 0;
 }
 
   bool has_dir_layout() const {
