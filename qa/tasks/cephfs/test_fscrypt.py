@@ -20,6 +20,8 @@ class FSCryptTestCase(CephFSTestCase):
         self.key_file = "/tmp/key"
         self.path = "dir/"
 
+        self.mount_a.run_shell_payload("sudo cat /proc/mounts")
+
         self.mount_a.run_shell_payload("sudo fscrypt --help")
         self.mount_a.run_shell_payload("sudo fscrypt setup --help")
         self.mount_a.run_shell_payload("sudo fscrypt setup --force --quiet")

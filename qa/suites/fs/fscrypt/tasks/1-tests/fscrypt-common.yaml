@@ -2,13 +2,15 @@ overrides:
   install:
     # Remove package manager installation of fscrypt
     extra_system_packages:
-      rpm: []
-      deb: []
+      rpm: 
+        - fscrypt
+      deb:
+        - fscrypt
 tasks:
-  - workunit:
-      clients:
-        all:
-          - fs/fscrypt_cli_setup.sh
+  #- workunit:
+  #    clients:
+  #      all:
+  #        - fs/fscrypt_cli_setup.sh
   - cephfs_test_runner:
       fail_on_skip: false
       modules:
