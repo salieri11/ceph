@@ -28,7 +28,8 @@
 #include <openssl/core_names.h>
 
 #include <string.h>
-#include <shared_mutex>
+#include <stdlib.h>
+#include <sys/mman.h>
 
 #define dout_subsys ceph_subsys_client
 
@@ -304,8 +305,28 @@ int FSCryptKey::init(const char *k, int klen) {
     return r;
   }
 
-  key.append_hole(klen);
-  memcpy(key.c_str(), k, klen);
+  // we don't want to have the key in core dump
+  // madvise must work with page aligned size
+  auto page_size = sysconf(_SC_PAGESIZE);
+  void *key_ptr = NULL;
+  int res = posix_memalign(&key_ptr, page_size, klen);
+  if (res != 0) {
+    ldout(cct, 0) << "ERROR: posix_memalign fail, page size: " << page_size
+     << ", retval: " << res << dendl;
+    return res;
+  }
+
+  res = madvise(key_ptr, klen, MADV_DONTDUMP);
+  if (res != 0) {
+    ldout(cct, 0) << "ERROR: MADV_DONTDUMP fail, original key size: "
+      << klen << ", page size: " << page_size << ", retval: " << res << dendl;
+
+  }
+
+  memcpy(key_ptr, k, klen);
+  auto raw_ptr = buffer::claim_char(klen, (char*)key_ptr);
+  buffer::ptr buffer_ptr(std::move(raw_ptr));
+  key.push_back(buffer_ptr);
 
   return 0;
 }
@@ -445,7 +466,7 @@ int FSCryptKeyStore::maybe_remove_user(struct fscrypt_remove_key_arg* arg, std::
 
 int FSCryptKeyStore::create(const char *k, int klen, FSCryptKeyHandlerRef& key_handler, int user)
 {
-  auto key = std::make_shared<FSCryptKey>();
+  auto key = std::make_shared<FSCryptKey>(cct);
 
   int r = key->init(k, klen);
   if (r < 0) {

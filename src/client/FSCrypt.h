@@ -90,7 +90,10 @@ std::ostream& operator<<(std::ostream& out, const ceph_fscrypt_key_identifier& k
 class FSCryptKey {
   bufferlist key;
   ceph_fscrypt_key_identifier identifier;
+  CephContext *cct;
+
 public:
+  explicit FSCryptKey(CephContext *_cct) : cct{_cct} {}
   int init(const char *k, int klen);
 
   int calc_hkdf(char ctx_indentifier,
