@@ -296,39 +296,57 @@ std::ostream& operator<<(std::ostream& out, const ceph_fscrypt_key_identifier& k
 }
 
 int FSCryptKey::init(const char *k, int klen) {
-  int r = fscrypt_calc_hkdf(HKDF_CONTEXT_KEY_IDENTIFIER,
-                            nullptr, 0, /* nonce */
-                            nullptr, 0, /* salt */
-                            (const char *)k, klen,
-                            identifier.raw, sizeof(identifier.raw));
-  if (r < 0) {
-    return r;
-  }
+    if (klen == 0) {
+        return -EINVAL;  // Handle zero-length key case
+    }
 
-  // we don't want to have the key in core dump
-  // madvise must work with page aligned size
-  auto page_size = sysconf(_SC_PAGESIZE);
-  void *key_ptr = NULL;
-  int res = posix_memalign(&key_ptr, page_size, klen);
-  if (res != 0) {
-    ldout(cct, 0) << "ERROR: posix_memalign fail, page size: " << page_size
-     << ", retval: " << res << dendl;
-    return res;
-  }
+    int r = fscrypt_calc_hkdf(HKDF_CONTEXT_KEY_IDENTIFIER,
+                              nullptr, 0, /* nonce */
+                              nullptr, 0, /* salt */
+                              k, klen,
+                              identifier.raw, sizeof(identifier.raw));
+    if (r < 0) {
+        return r;
+    }
 
-  res = madvise(key_ptr, klen, MADV_DONTDUMP);
-  if (res != 0) {
-    ldout(cct, 0) << "ERROR: MADV_DONTDUMP fail, original key size: "
-      << klen << ", page size: " << page_size << ", retval: " << res << dendl;
+    // get system page size
+    size_t page_size = sysconf(_SC_PAGESIZE);
+    // this is the actual allocation size, rounded to the page size
+    map_size = (klen + page_size - 1) & ~(page_size - 1);  // Round up
 
-  }
+    // allocate a dedicated memory region for the key
+    // since the first arg is null, mmap will use page aligned address for this allocation
+    // this is exactly what madvise() needs - page aligned address
+    // the map_size is equal to the system page size
+    // this memory region will be used solely for the key, and will be completely excluded from the core dump
+    key_ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
+                   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (key_ptr == MAP_FAILED) {
+        ldout(cct, 0) << "ERROR: mmap() failed: " << strerror(errno) << dendl;
+        key_ptr = nullptr;
+        map_size = 0;
+        return -ENOMEM;
+    }
 
-  memcpy(key_ptr, k, klen);
-  auto raw_ptr = buffer::claim_char(klen, (char*)key_ptr);
-  buffer::ptr buffer_ptr(std::move(raw_ptr));
-  key.push_back(buffer_ptr);
+    // exclude this region from core dumps
+    if (madvise(key_ptr, map_size, MADV_DONTDUMP) != 0) {
+        ldout(cct, 0) << "ERROR: MADV_DONTDUMP failed: " << strerror(errno) << dendl;
+        // unmap the memory
+        munmap(key_ptr, map_size);
+        key_ptr = nullptr;
+        map_size = 0;
+        return -EINVAL;
+    }
 
-  return 0;
+    // copy the key securely
+    memcpy(key_ptr, k, klen);
+
+    // keep actual key as buffer list
+    auto raw_ptr = buffer::claim_char(klen, (char*)key_ptr);
+    buffer::ptr buffer_ptr(std::move(raw_ptr));
+    key.push_back(buffer_ptr);
+
+    return 0;
 }
 
 int FSCryptKey::calc_hkdf(char ctx_identifier,
