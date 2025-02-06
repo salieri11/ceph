@@ -91,9 +91,20 @@ class FSCryptKey {
   bufferlist key;
   ceph_fscrypt_key_identifier identifier;
   CephContext *cct;
+  void *key_ptr = nullptr; // mapped memory ptr
+  size_t map_size = 0;     // mapped memory size
 
 public:
   explicit FSCryptKey(CephContext *_cct) : cct{_cct} {}
+
+  // Securely erase and free memory on destruction
+  ~FSCryptKey() {
+      if (key_ptr && map_size) {
+          // unnmap memory
+          munmap(key_ptr, map_size);
+      }
+  }
+
   int init(const char *k, int klen);
 
   int calc_hkdf(char ctx_indentifier,
