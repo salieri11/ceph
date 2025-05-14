@@ -28,6 +28,7 @@
 #include <openssl/core_names.h>
 
 #include <string.h>
+#include <shared_mutex>
 #include <stdlib.h>
 #include <sys/mman.h>
 
@@ -295,6 +296,8 @@ std::ostream& operator<<(std::ostream& out, const ceph_fscrypt_key_identifier& k
   return out;
 }
 
+#include <cstring>  // For memset_s
+
 int FSCryptKey::init(const char *k, int klen) {
     if (klen == 0) {
         return -EINVAL;  // Handle zero-length key case
@@ -309,39 +312,44 @@ int FSCryptKey::init(const char *k, int klen) {
         return r;
     }
 
-    // get system page size
+    // Get system page size
     size_t page_size = sysconf(_SC_PAGESIZE);
-    // this is the actual allocation size, rounded to the page size
     map_size = (klen + page_size - 1) & ~(page_size - 1);  // Round up
 
-    // allocate a dedicated memory region for the key
-    // since the first arg is null, mmap will use page aligned address for this allocation
-    // this is exactly what madvise() needs - page aligned address
-    // the map_size is equal to the system page size
-    // this memory region will be used solely for the key, and will be completely excluded from the core dump
+    // Allocate a dedicated memory region for the key
     key_ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
                    MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (key_ptr == MAP_FAILED) {
-        ldout(cct, 0) << "ERROR: mmap() failed: " << strerror(errno) << dendl;
+        ldout(cct, 0) << "ERROR: mmap() failed: " << strerror(r) << dendl;
         key_ptr = nullptr;
         map_size = 0;
         return -ENOMEM;
     }
 
-    // exclude this region from core dumps
-    if (madvise(key_ptr, map_size, MADV_DONTDUMP) != 0) {
-        ldout(cct, 0) << "ERROR: MADV_DONTDUMP failed: " << strerror(errno) << dendl;
-        // unmap the memory
+    // Prevent this region from being swapped
+    r = mlock(key_ptr, map_size);
+    if (r) {
+        ldout(cct, 0) << "ERROR: mlock() failed: " << strerror(r) << dendl;
         munmap(key_ptr, map_size);
         key_ptr = nullptr;
         map_size = 0;
-        return -EINVAL;
+        return r;
     }
 
-    // copy the key securely
+    // Exclude this region from core dumps
+    r = madvise(key_ptr, map_size, MADV_DONTDUMP);
+    if (r) {
+        ldout(cct, 0) << "ERROR: MADV_DONTDUMP failed: " << strerror(r) << dendl;
+        munlock(key_ptr, map_size);  // Unlock before unmapping
+        munmap(key_ptr, map_size);
+        key_ptr = nullptr;
+        map_size = 0;
+        return r;
+    }
+
+    // Copy the key securely
     memcpy(key_ptr, k, klen);
 
-    // keep actual key as buffer list
     auto raw_ptr = buffer::claim_char(klen, (char*)key_ptr);
     buffer::ptr buffer_ptr(std::move(raw_ptr));
     key.push_back(buffer_ptr);
