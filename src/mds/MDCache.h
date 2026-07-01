@@ -830,6 +830,9 @@ private:
   bool shutdown_pass();
   bool shutdown();                    // clear cache (ie at shutodwn)
   bool shutdown_export_strays();
+
+  std::vector<inodeno_t> get_subvolume_inos() const;
+
   void shutdown_export_stray_finish(inodeno_t ino) {
     if (shutdown_exporting_strays.erase(ino))
       shutdown_export_strays();

@@ -488,6 +488,7 @@ MDSRank::MDSRank(
       )
     ),
     metrics_handler(cct, this),
+    sharding_telemetry_(this),
     beacon(beacon_),
     messenger(msgr), monc(monc_), mgrc(mgrc),
     respawn_hook(respawn_hook_),
@@ -1066,6 +1067,10 @@ bool MDSRank::_dispatch(const cref_t<Message> &m, bool new_msg)
   // do not proceed if this message cannot be handled
   if (!is_valid_message(m)) {
     return false;
+  }
+
+  if (new_msg) {
+    record_client_request_sharding(m);
   }
 
   if (beacon.is_laggy()) {
@@ -2161,6 +2166,8 @@ void MDSRank::active_start()
   mdcache->reissue_all_caps();
 
   finish_contexts(g_ceph_context, ls_.waiting_for_active);  // kick waiters
+
+  populate_subvolume_registry();
 
   quiesce_agent_setup();
 }
@@ -4354,4 +4361,125 @@ void MDSRank::reset_event_flags() {
   ls_.client_eviction_dump = false;
   beacon.missed_beacon_ack_dump = false;
   beacon.missed_internal_heartbeat_dump = false;
+}
+
+namespace {
+
+inodeno_t subvol_for_inode(CInode *in)
+{
+  if (!in) {
+    return inodeno_t(0);
+  }
+  return in->get_subvolume_id();
+}
+
+inodeno_t subvol_for_path(MDCache *mdcache, const filepath& fp)
+{
+  if (fp.empty()) {
+    return inodeno_t(0);
+  }
+  return subvol_for_inode(mdcache->cache_traverse(fp));
+}
+
+bool op_uses_second_path(int op)
+{
+  return op == CEPH_MDS_OP_RENAME ||
+         op == CEPH_MDS_OP_LINK ||
+         op == CEPH_MDS_OP_RENAMESNAP;
+}
+
+} // anonymous namespace
+
+void MDSRank::register_subvolume(inodeno_t subvol_ino)
+{
+  ceph_assert(dispatch_mutex_is_locked_by_me());
+  if (!subvol_ino) {
+    return;
+  }
+  subvolume_states_.try_emplace(subvol_ino, SubvolumeState(subvol_ino));
+  sharding_state_.subvolume_count = subvolume_states_.size();
+  sharding_telemetry_.set_subvolume_count(sharding_state_.subvolume_count);
+  dout(10) << __func__ << " subvol_ino=" << subvol_ino
+           << " registry_size=" << subvolume_states_.size() << dendl;
+}
+
+void MDSRank::deregister_subvolume(inodeno_t subvol_ino)
+{
+  ceph_assert(dispatch_mutex_is_locked_by_me());
+  if (!subvol_ino) {
+    return;
+  }
+  subvolume_states_.erase(subvol_ino);
+  sharding_state_.subvolume_count = subvolume_states_.size();
+  sharding_telemetry_.set_subvolume_count(sharding_state_.subvolume_count);
+  dout(10) << __func__ << " subvol_ino=" << subvol_ino
+           << " registry_size=" << subvolume_states_.size() << dendl;
+}
+
+void MDSRank::populate_subvolume_registry()
+{
+  ceph_assert(dispatch_mutex_is_locked_by_me());
+  for (auto ino : mdcache->get_subvolume_inos()) {
+    register_subvolume(ino);
+  }
+  dout(1) << __func__ << " populated " << subvolume_states_.size()
+          << " subvolume(s)" << dendl;
+}
+
+ClientRequestClassification MDSRank::classify_client_request(
+  const cref_t<Message> &m)
+{
+  ClientRequestClassification result;
+  if (m->get_type() != CEPH_MSG_CLIENT_REQUEST || !is_active()) {
+    return result;
+  }
+
+  const auto &req = ref_cast<MClientRequest>(m);
+  inodeno_t primary = inodeno_t(0);
+  if (req->head.ino) {
+    primary = subvol_for_inode(mdcache->get_inode(inodeno_t(req->head.ino)));
+  }
+  if (!primary) {
+    primary = subvol_for_path(mdcache, req->get_filepath());
+  }
+
+  if (!primary || !subvolume_states_.count(primary)) {
+    return result;
+  }
+
+  if (op_uses_second_path(req->get_op()) && !req->get_filepath2().empty()) {
+    inodeno_t secondary = subvol_for_path(mdcache, req->get_filepath2());
+    if (secondary && secondary != primary) {
+      result.cls = ShardingClass::CrossSubvolume;
+      result.subvol_ino = primary;
+      return result;
+    }
+  }
+
+  result.cls = ShardingClass::Shardable;
+  result.subvol_ino = primary;
+  return result;
+}
+
+void MDSRank::record_client_request_sharding(const cref_t<Message> &m)
+{
+  if (m->get_type() != CEPH_MSG_CLIENT_REQUEST) {
+    return;
+  }
+
+  const auto classification = classify_client_request(m);
+  switch (classification.cls) {
+  case ShardingClass::Shardable:
+    sharding_telemetry_.record_shardable(classification.subvol_ino);
+    dout(25) << __func__ << " shardable subvol=" << classification.subvol_ino
+             << " (could_drop_mds_lock="
+             << could_drop_mds_lock(classification) << ')' << dendl;
+    break;
+  case ShardingClass::CrossSubvolume:
+    sharding_telemetry_.record_cross_subvol();
+    break;
+  default:
+    sharding_telemetry_.record_global();
+    break;
+  }
 }

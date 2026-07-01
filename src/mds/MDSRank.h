@@ -28,6 +28,8 @@
 #include "DamageTable.h"
 #include "CowSnapshot.h"
 #include "MDSMap.h"
+#include "ShardingTelemetry.h"
+#include "SubvolumeState.h"
 #include "SessionMap.h"
 #include "PurgeQueue.h"
 #include "MetricsHandler.h"
@@ -473,6 +475,20 @@ class MDSRank {
 
     std::string get_path(inodeno_t ino);
 
+    // Subvolume registry + request classification (telemetry only for now).
+    void register_subvolume(inodeno_t subvol_ino);
+    void deregister_subvolume(inodeno_t subvol_ino);
+    void populate_subvolume_registry();
+    ClientRequestClassification classify_client_request(const cref_t<Message> &m);
+    void record_client_request_sharding(const cref_t<Message> &m);
+    const std::map<inodeno_t, SubvolumeState>& get_subvolume_states() const {
+      return subvolume_states_;
+    }
+    bool could_drop_mds_lock(const ClientRequestClassification &c) const {
+      return c.cls == ShardingClass::Shardable &&
+             c.subvol_ino && subvolume_states_.count(c.subvol_ino);
+    }
+
     // Reference to global MDS::mds_lock, so that users of MDSRank don't
     // carry around references to the outer MDS, and we can substitute
     // a separate lock here in future potentially.
@@ -681,6 +697,10 @@ class MDSRank {
 
     MetricsHandler metrics_handler;
     std::unique_ptr<MetricAggregator> metric_aggregator;
+
+    std::map<inodeno_t, SubvolumeState> subvolume_states_;
+    ShardingTelemetryCollector sharding_telemetry_;
+    MDSRankShardingState sharding_state_;
 
     // Const reference to the beacon so that we can behave differently
     // when it's laggy.

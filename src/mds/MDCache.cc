@@ -327,6 +327,18 @@ bool MDCache::shutdown()
   return true;
 }
 
+std::vector<inodeno_t> MDCache::get_subvolume_inos() const
+{
+  std::vector<inodeno_t> inos;
+  for (const auto& [ino, in] : inode_map) {
+    const auto srnode = in->get_projected_srnode();
+    if (srnode && srnode->is_subvolume()) {
+      inos.push_back(ino);
+    }
+  }
+  return inos;
+}
+
 
 // ====================================================================
 // some inode functions

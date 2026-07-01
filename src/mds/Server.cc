@@ -6527,9 +6527,11 @@ void Server::handle_client_setvxattr(const MDRequestRef& mdr, CInode *cur)
     if (val) {
       dout(20) << "marking subvolume for ino: " << cur->ino() << dendl;
       pi.snapnode->mark_subvolume();
+      mds->register_subvolume(cur->ino());
     } else {
       dout(20) << "clearing subvolume for ino: " << cur->ino() << dendl;
       pi.snapnode->clear_subvolume();
+      mds->deregister_subvolume(cur->ino());
     }
 
     mdr->no_early_reply = true;
