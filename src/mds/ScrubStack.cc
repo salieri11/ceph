@@ -71,7 +71,7 @@ void ScrubStack::dequeue(MDSCacheObject *obj)
 
 int ScrubStack::_enqueue(MDSCacheObject *obj, ScrubHeaderRef& header, bool top)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mdcache->mds->mds_lock));
+  ceph_assert(mdcache->mds->dispatch_mutex_is_locked_by_me());
   if (CInode *in = dynamic_cast<CInode*>(obj)) {
     if (in->scrub_is_in_progress()) {
       dout(10) << __func__ << " with {" << *in << "}" << ", already in scrubbing" << dendl;
@@ -241,7 +241,7 @@ private:
 
 void ScrubStack::kick_off_scrubs()
 {
-  ceph_assert(ceph_mutex_is_locked(mdcache->mds->mds_lock));
+  ceph_assert(mdcache->mds->dispatch_mutex_is_locked());
   dout(20) << __func__ << ": state=" << state << dendl;
 
   if (clear_stack || state == STATE_PAUSING || state == STATE_PAUSED) {
@@ -627,7 +627,7 @@ void ScrubStack::_validate_inode_done(CInode *in, int r,
 }
 
 void ScrubStack::complete_control_contexts(int r) {
-  ceph_assert(ceph_mutex_is_locked_by_me(mdcache->mds->mds_lock));
+  ceph_assert(mdcache->mds->dispatch_mutex_is_locked_by_me());
 
   for (auto &ctx : control_ctxs) {
     ctx->complete(r);
@@ -645,7 +645,7 @@ void ScrubStack::set_state(State next_state) {
 }
 
 bool ScrubStack::scrub_in_transition_state() {
-  ceph_assert(ceph_mutex_is_locked_by_me(mdcache->mds->mds_lock));
+  ceph_assert(mdcache->mds->dispatch_mutex_is_locked_by_me());
   dout(20) << __func__ << ": state=" << state << dendl;
 
   // STATE_RUNNING is considered as a transition state so as to
@@ -658,7 +658,7 @@ bool ScrubStack::scrub_in_transition_state() {
 }
 
 std::string_view ScrubStack::scrub_summary() {
-  ceph_assert(ceph_mutex_is_locked_by_me(mdcache->mds->mds_lock));
+  ceph_assert(mdcache->mds->dispatch_mutex_is_locked_by_me());
 
   bool have_more = false;
   CachedStackStringStream cs;
@@ -712,7 +712,7 @@ std::string_view ScrubStack::scrub_summary() {
 }
 
 void ScrubStack::scrub_status(Formatter *f) {
-  ceph_assert(ceph_mutex_is_locked_by_me(mdcache->mds->mds_lock));
+  ceph_assert(mdcache->mds->dispatch_mutex_is_locked_by_me());
 
   f->open_object_section("result");
 
@@ -833,7 +833,7 @@ void ScrubStack::scrub_status(Formatter *f) {
 }
 
 void ScrubStack::abort_pending_scrubs() {
-  ceph_assert(ceph_mutex_is_locked_by_me(mdcache->mds->mds_lock));
+  ceph_assert(mdcache->mds->dispatch_mutex_is_locked_by_me());
   ceph_assert(clear_stack);
 
   auto abort_one = [this](MDSCacheObject *obj) {
@@ -875,7 +875,7 @@ void ScrubStack::send_state_message(int op) {
 }
 
 void ScrubStack::scrub_abort(Context *on_finish) {
-  ceph_assert(ceph_mutex_is_locked_by_me(mdcache->mds->mds_lock));
+  ceph_assert(mdcache->mds->dispatch_mutex_is_locked_by_me());
 
   dout(10) << __func__ << ": aborting with " << scrubs_in_progress
            << " scrubs in progress and " << stack_size << " in the"
@@ -903,7 +903,7 @@ void ScrubStack::scrub_abort(Context *on_finish) {
 }
 
 void ScrubStack::scrub_pause(Context *on_finish) {
-  ceph_assert(ceph_mutex_is_locked_by_me(mdcache->mds->mds_lock));
+  ceph_assert(mdcache->mds->dispatch_mutex_is_locked_by_me());
 
   dout(10) << __func__ << ": pausing with " << scrubs_in_progress
            << " scrubs in progress and " << stack_size << " in the"
@@ -933,7 +933,7 @@ void ScrubStack::scrub_pause(Context *on_finish) {
 }
 
 bool ScrubStack::scrub_resume() {
-  ceph_assert(ceph_mutex_is_locked_by_me(mdcache->mds->mds_lock));
+  ceph_assert(mdcache->mds->dispatch_mutex_is_locked_by_me());
   dout(20) << __func__ << ": state=" << state << dendl;
 
   if (mdcache->mds->get_nodeid() == 0)

@@ -1348,6 +1348,24 @@ private:
   void repair_dirfrag_stats_work(const MDRequestRef& mdr);
   void rdlock_dirfrags_stats_work(const MDRequestRef& mdr);
 
+  // Phase 3: per-subvolume head-inode partition index.  inode_map remains
+  // the authoritative O(1) lookup; this index makes subvolume boundaries
+  // explicit for future per-partition locking (still under mds_lock).
+  std::unordered_map<inodeno_t, std::unordered_map<inodeno_t, CInode*>>
+    subvolume_inode_map;
+
+  const std::unordered_map<inodeno_t, CInode*>*
+  get_subvolume_inode_partition(inodeno_t subvol_ino) const {
+    auto it = subvolume_inode_map.find(subvol_ino);
+    if (it == subvolume_inode_map.end()) {
+      return nullptr;
+    }
+    return &it->second;
+  }
+  size_t get_subvolume_partition_count() const {
+    return subvolume_inode_map.size();
+  }
+
   std::unordered_map<inodeno_t, CInode*> inode_map;  // map of head inodes by ino
   std::map<vinodeno_t, CInode*> snap_inode_map;  // map of snap inodes by ino
   CInode *root = nullptr; // root inode

@@ -72,6 +72,14 @@ class MDSDaemon : public Dispatcher {
    * must either do nothing and immediately drop the lock, or
    * never drop the lock again (i.e. call respawn()) */
   ceph::fair_mutex mds_lock{"MDSDaemon::mds_lock"};
+
+  bool dispatch_mutex_is_locked_by_me() const {
+    return ceph_mutex_is_locked_by_me(mds_lock);
+  }
+  bool dispatch_mutex_is_locked() const {
+    return ceph_mutex_is_locked(mds_lock);
+  }
+
   bool stopping = false;
 
   class CommonSafeTimer<ceph::fair_mutex> timer;

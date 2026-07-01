@@ -719,7 +719,7 @@ void MDSDaemon::reset_tick()
   tick_event = timer.add_event_after(
     g_conf()->mds_tick_interval,
     new LambdaContext([this](int) {
-	ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+	ceph_assert(dispatch_mutex_is_locked_by_me());
 	tick();
       }));
 }
@@ -927,7 +927,7 @@ void MDSDaemon::handle_signal(int signum)
 
 void MDSDaemon::suicide()
 {
-  ceph_assert(ceph_mutex_is_locked(mds_lock));
+  ceph_assert(dispatch_mutex_is_locked());
   
   // make sure we don't suicide twice
   ceph_assert(stopping == false);

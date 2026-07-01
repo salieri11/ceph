@@ -83,7 +83,7 @@ public:
   }
 
   void send() {
-    ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+    ceph_assert(mds->dispatch_mutex_is_locked_by_me());
 
     dout(20) << __func__ << dendl;
 
@@ -123,7 +123,7 @@ private:
   }
 
   void handle_clear_mdlog(int r) {
-    ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+    ceph_assert(mds->dispatch_mutex_is_locked_by_me());
     dout(20) << __func__ << ": r=" << r << dendl;
 
     if (r != 0) {
@@ -181,7 +181,7 @@ private:
   }
 
   void trim_expired_segments() {
-    ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+    ceph_assert(mds->dispatch_mutex_is_locked_by_me());
     dout(5) << __func__ << ": expiry complete, expire_pos/trim_pos is now "
             << std::hex << mdlog->get_journaler()->get_expire_pos() << "/"
             << mdlog->get_journaler()->get_trimmed_pos() << dendl;
@@ -207,7 +207,7 @@ private:
     /* We don't need the mds_lock but MDLog::write_head takes an MDSContext so
      * we are expected to have it.
      */
-    ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+    ceph_assert(mds->dispatch_mutex_is_locked_by_me());
     dout(20) << __func__ << ": r=" << r << dendl;
 
     dout(5) << __func__ << ": trimming is complete; wait for journal head write. Journal expire_pos/trim_pos is now "
@@ -242,7 +242,7 @@ public:
   void send() {
     // not really a hard requirement here, but lets ensure this in
     // case we change the logic here.
-    ceph_assert(ceph_mutex_is_locked(mds->mds_lock));
+    ceph_assert(mds->dispatch_mutex_is_locked());
 
     dout(20) << __func__ << dendl;
     f->open_object_section("result");
@@ -944,7 +944,7 @@ void MDSRank::abort(std::string_view msg)
 void MDSRank::damaged()
 {
   ceph_assert(whoami != MDS_RANK_NONE);
-  ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+  ceph_assert(dispatch_mutex_is_locked_by_me());
 
   beacon.set_want_state(*mdsmap, MDSMap::STATE_DAMAGED);
   monc->flush_log();  // Flush any clog error from before we were called
@@ -1018,7 +1018,7 @@ void *MDSRank::ProgressThread::entry()
 
 void MDSRank::ProgressThread::shutdown()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  ceph_assert(mds->dispatch_mutex_is_locked_by_me());
   ceph_assert(mds->ls_.stopping);
 
   if (am_self()) {
@@ -1318,7 +1318,7 @@ void MDSRank::handle_message(const cref_t<Message> &m)
  */
 void MDSRank::_advance_queues()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+  ceph_assert(dispatch_mutex_is_locked_by_me());
 
   if (!ls_.finished_queue.empty()) {
     dout(7) << "mds has " << ls_.finished_queue.size() << " queued contexts" << dendl;
@@ -1747,7 +1747,7 @@ void MDSRank::boot_start(BootStep step, int r)
 
 void MDSRank::validate_sessions()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+  ceph_assert(dispatch_mutex_is_locked_by_me());
   bool valid = true;
 
   // Identify any sessions which have ls_.state inconsistent with other,
@@ -3947,7 +3947,7 @@ bool MDSRank::evict_client(int64_t session_id,
     bool wait, bool blocklist, std::ostream& err_ss,
     Context *on_killed)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+  ceph_assert(dispatch_mutex_is_locked_by_me());
 
   // Mutually exclusive args
   ceph_assert(!(wait && on_killed != nullptr));
@@ -3982,7 +3982,7 @@ bool MDSRank::evict_client(int64_t session_id,
   std::vector<std::string> cmd = {css->str()};
 
   auto kill_client_session = [this, session_id, wait, on_killed](){
-    ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+    ceph_assert(dispatch_mutex_is_locked_by_me());
     Session *session = sessionmap.get_session(
         entity_name_t(CEPH_ENTITY_TYPE_CLIENT, session_id));
     if (session) {
@@ -4009,7 +4009,7 @@ bool MDSRank::evict_client(int64_t session_id,
   };
 
   auto apply_blocklist = [this, &cmd](std::function<void ()> fn){
-    ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+    ceph_assert(dispatch_mutex_is_locked_by_me());
 
     Context *on_blocklist_done = new LambdaContext([this, fn](int r) {
       objecter->wait_for_latest_osdmap(

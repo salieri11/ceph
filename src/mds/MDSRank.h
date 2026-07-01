@@ -478,6 +478,15 @@ class MDSRank {
     // a separate lock here in future potentially.
     ceph::fair_mutex &mds_lock;
 
+    // Phase 3: abstract dispatch lock check.  Today this is always mds_lock;
+    // later it may accept a per-shard lock when dispatch is bifurcated.
+    bool dispatch_mutex_is_locked_by_me() const {
+      return ceph_mutex_is_locked_by_me(mds_lock);
+    }
+    bool dispatch_mutex_is_locked() const {
+      return ceph_mutex_is_locked(mds_lock);
+    }
+
     // Reference to global cluster log client, just to avoid initialising
     // a separate one here.
     LogChannelRef &clog;

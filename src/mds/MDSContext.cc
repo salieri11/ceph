@@ -24,7 +24,7 @@
 void MDSContext::finish(int r) {
   MDSRank *mds = get_mds();
   ceph_assert(mds != nullptr);
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  ceph_assert(mds->dispatch_mutex_is_locked_by_me());
   dout(10) << "MDSContext::finish: " << typeid(*this).name() << dendl;
   mds->heartbeat_reset();
 }

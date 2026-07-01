@@ -308,7 +308,7 @@ void Beacon::notify_health(MDSRank const *mds)
   }
 
   // I'm going to touch this MDS, so it must be locked
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  ceph_assert(mds->dispatch_mutex_is_locked_by_me());
 
   health.metrics.clear();
 

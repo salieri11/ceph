@@ -331,6 +331,35 @@ bool MDCache::shutdown()
 // ====================================================================
 // some inode functions
 
+static void add_inode_to_subvolume_partition(
+  std::unordered_map<inodeno_t, std::unordered_map<inodeno_t, CInode*>> &partitions,
+  CInode *in)
+{
+  inodeno_t subvol_ino = in->get_subvolume_id();
+  if (!subvol_ino) {
+    return;
+  }
+  partitions[subvol_ino][in->ino()] = in;
+}
+
+static void remove_inode_from_subvolume_partition(
+  std::unordered_map<inodeno_t, std::unordered_map<inodeno_t, CInode*>> &partitions,
+  CInode *in)
+{
+  inodeno_t subvol_ino = in->get_subvolume_id();
+  if (!subvol_ino) {
+    return;
+  }
+  auto part_it = partitions.find(subvol_ino);
+  if (part_it == partitions.end()) {
+    return;
+  }
+  part_it->second.erase(in->ino());
+  if (part_it->second.empty()) {
+    partitions.erase(part_it);
+  }
+}
+
 void MDCache::add_inode(CInode *in)
 {
   // add to inode map
@@ -338,6 +367,7 @@ void MDCache::add_inode(CInode *in)
     auto &p = inode_map[in->ino()];
     ceph_assert(!p); // should be no dup inos!
     p = in;
+    add_inode_to_subvolume_partition(subvolume_inode_map, in);
   } else {
     auto &p = snap_inode_map[in->vino()];
     ceph_assert(!p); // should be no dup inos!
@@ -391,6 +421,7 @@ void MDCache::remove_inode(CInode *o)
 
   // remove from inode map
   if (o->last == CEPH_NOSNAP) {
+    remove_inode_from_subvolume_partition(subvolume_inode_map, o);
     inode_map.erase(o->ino());
   } else {
     o->item_caps.remove_myself();

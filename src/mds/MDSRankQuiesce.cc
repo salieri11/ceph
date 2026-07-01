@@ -557,7 +557,7 @@ void MDSRank::quiesce_agent_setup() {
 
         auto quiesce_task = new LambdaContext([dummy_requests, req_id, do_fail, this](int) {
           // the mds lock should be held by the timer
-          ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+          ceph_assert(dispatch_mutex_is_locked_by_me());
           dout(20) << "quiesce_task: callback by the timer" << dendl;
           auto it = std::ranges::find(*dummy_requests, req_id, [](auto x) { return x.second.first; });
           if (it != dummy_requests->end() && it->second.second != nullptr) {

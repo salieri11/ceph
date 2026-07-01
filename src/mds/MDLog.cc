@@ -169,7 +169,7 @@ protected:
 
 void MDLog::finish_head_waiters()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  ceph_assert(mds->dispatch_mutex_is_locked_by_me());
 
   auto&& last_committed = journaler->get_last_committed();
   auto& expire_pos = last_committed.expire_pos;
@@ -187,7 +187,7 @@ void MDLog::finish_head_waiters()
 
 void MDLog::write_head(MDSContext *c) 
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  ceph_assert(mds->dispatch_mutex_is_locked_by_me());
 
   auto&& last_written = journaler->get_last_written();
   auto expire_pos = journaler->get_expire_pos();
@@ -266,7 +266,7 @@ EstimatedReplayTime MDLog::get_estimated_replay_finish_time() {
 
 void MDLog::create(MDSContext *c)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  ceph_assert(mds->dispatch_mutex_is_locked_by_me());
 
   dout(5) << "create empty log" << dendl;
 
@@ -373,7 +373,7 @@ void MDLog::append()
 
 LogSegmentRef const& MDLog::_start_new_segment(SegmentBoundary* sb)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  ceph_assert(mds->dispatch_mutex_is_locked_by_me());
 
   auto ls = std::make_shared<LogSegment>(event_seq);
   segments[event_seq] = ls;
@@ -393,7 +393,7 @@ LogSegmentRef const& MDLog::_start_new_segment(SegmentBoundary* sb)
 LogSegment::seq_t MDLog::_submit_entry(LogEvent *le, MDSLogContextBase* c)
 {
   dout(20) << __func__ << " " << *le << dendl;
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  ceph_assert(mds->dispatch_mutex_is_locked_by_me());
   ceph_assert(ceph_mutex_is_locked_by_me(submit_mutex));
   ceph_assert(!mds->is_any_replay());
   ceph_assert(!mds_is_shutting_down);
@@ -442,7 +442,7 @@ LogSegment::seq_t MDLog::_submit_entry(LogEvent *le, MDSLogContextBase* c)
 
 void MDLog::_segment_upkeep()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  ceph_assert(mds->dispatch_mutex_is_locked_by_me());
   ceph_assert(ceph_mutex_is_locked_by_me(submit_mutex));
   uint64_t period = journaler->get_layout_period();
   auto ls = get_current_segment();
@@ -630,7 +630,7 @@ void MDLog::cap()
 
 void MDLog::shutdown()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  ceph_assert(mds->dispatch_mutex_is_locked_by_me());
 
   dout(5) << "shutdown" << dendl;
   if (submit_thread.is_started()) {
@@ -908,7 +908,7 @@ int MDLog::trim_to(SegmentBoundary::seq_t seq)
 
 void MDLog::try_expire(LogSegmentRef const& ls, int op_prio)
 {
-  ceph_assert(ceph_mutex_is_locked(mds->mds_lock));
+  ceph_assert(mds->dispatch_mutex_is_locked());
   MDSGatherBuilder gather_bld(g_ceph_context);
   ls->try_to_expire(mds, gather_bld, op_prio);
 
