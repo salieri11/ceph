@@ -602,7 +602,7 @@ void MDSRankDispatcher::init()
 
 void MDSRank::update_targets()
 {
-  // get MonMap's idea of my ls_.export_targets
+  // get MonMap's idea of my export_targets
   const set<mds_rank_t>& map_targets = mdsmap->get_mds_info(get_nodeid()).export_targets;
 
   dout(20) << "updating export targets, currently " << map_targets.size() << " ranks are targets" << dendl;
@@ -610,33 +610,36 @@ void MDSRank::update_targets()
   bool send = false;
   set<mds_rank_t> new_map_targets;
 
-  auto it = ls_.export_targets.begin();
-  while (it != ls_.export_targets.end()) {
-    mds_rank_t rank = it->first;
-    auto &counter = it->second;
-    dout(20) << "export target mds." << rank << " is " << counter << dendl;
+  mutate_export_targets([&](ExportTargetsMap& targets) {
+    auto it = targets.begin();
+    while (it != targets.end()) {
+      mds_rank_t rank = it->first;
+      auto &counter = it->second;
+      dout(20) << "export target mds." << rank << " is " << counter << dendl;
 
-    double val = counter.get();
-    if (val <= 0.01) {
-      dout(15) << "export target mds." << rank << " is no longer an export target" << dendl;
-      ls_.export_targets.erase(it++);
-      send = true;
-      continue;
+      double val = counter.get();
+      if (val <= 0.01) {
+        dout(15) << "export target mds." << rank << " is no longer an export target" << dendl;
+        it = targets.erase(it);
+        send = true;
+        continue;
+      }
+      if (!map_targets.count(rank)) {
+        dout(15) << "export target mds." << rank << " not in map's export_targets" << dendl;
+        send = true;
+      }
+      new_map_targets.insert(rank);
+      ++it;
     }
-    if (!map_targets.count(rank)) {
-      dout(15) << "export target mds." << rank << " not in map's ls_.export_targets" << dendl;
-      send = true;
-    }
-    new_map_targets.insert(rank);
-    it++;
-  }
+  });
+
   if (new_map_targets.size() < map_targets.size()) {
     dout(15) << "export target map holds stale targets, sending update" << dendl;
     send = true;
   }
 
   if (send) {
-    dout(15) << "updating ls_.export_targets, now " << new_map_targets.size() << " ranks are targets" << dendl;
+    dout(15) << "updating export_targets, now " << new_map_targets.size() << " ranks are targets" << dendl;
     auto m = make_message<MMDSLoadTargets>(mds_gid_t(monc->get_global_id()), new_map_targets);
     monc->send_mon_message(m.detach());
   }
@@ -648,14 +651,18 @@ void MDSRank::hit_export_target(mds_rank_t rank, double amount)
   if (amount < 0.0) {
     amount = 100.0/rate; /* a good default for "i am trying to keep this export_target active" */
   }
-  auto em = ls_.export_targets.emplace(std::piecewise_construct, std::forward_as_tuple(rank), std::forward_as_tuple(DecayRate(rate)));
-  auto &counter = em.first->second;
-  counter.hit(amount);
-  if (em.second) {
-    dout(15) << "hit export target (new) is " << counter << dendl;
-  } else {
-    dout(15) << "hit export target is " << counter << dendl;
-  }
+  mutate_export_targets([&](ExportTargetsMap& targets) {
+    auto em = targets.emplace(std::piecewise_construct,
+                              std::forward_as_tuple(rank),
+                              std::forward_as_tuple(DecayRate(rate)));
+    auto &counter = em.first->second;
+    counter.hit(amount);
+    if (em.second) {
+      dout(15) << "hit export target (new) is " << counter << dendl;
+    } else {
+      dout(15) << "hit export target is " << counter << dendl;
+    }
+  });
 }
 
 class C_MDS_MonCommand : public MDSInternalContext {
@@ -1478,10 +1485,15 @@ int MDSRank::send_message_mds(const ref_t<Message>& m, mds_rank_t mds)
 
   // send mdsmap first?
   auto addrs = mdsmap->get_addrs(mds);
-  if (mds != whoami && ls_.peer_mdsmap_epoch[mds] < mdsmap->get_epoch()) {
+  auto peer_epochs = read_peer_mdsmap_epochs();
+  auto peer_it = peer_epochs->find(mds);
+  if (mds != whoami &&
+      (peer_it == peer_epochs->end() || peer_it->second < mdsmap->get_epoch())) {
     auto _m = make_message<MMDSMap>(monc->get_fsid(), *mdsmap);
     send_message_mds(_m, addrs);
-    ls_.peer_mdsmap_epoch[mds] = mdsmap->get_epoch();
+    mutate_peer_mdsmap_epochs([&](PeerMdsmapEpochMap& epochs) {
+      epochs[mds] = mdsmap->get_epoch();
+    });
   }
 
   // send message
@@ -2303,12 +2315,18 @@ void MDSRankDispatcher::handle_mds_map(
   version_t epoch = m->get_epoch();
 
   // note source's map version
-  if (m->get_source().is_mds() &&
-      ls_.peer_mdsmap_epoch[mds_rank_t(m->get_source().num())] < epoch) {
-    dout(15) << " peer " << m->get_source()
-	     << " has mdsmap epoch >= " << epoch
-	     << dendl;
-    ls_.peer_mdsmap_epoch[mds_rank_t(m->get_source().num())] = epoch;
+  if (m->get_source().is_mds()) {
+    mds_rank_t peer = mds_rank_t(m->get_source().num());
+    auto peer_epochs = read_peer_mdsmap_epochs();
+    auto peer_it = peer_epochs->find(peer);
+    if (peer_it == peer_epochs->end() || peer_it->second < epoch) {
+      dout(15) << " peer " << m->get_source()
+	       << " has mdsmap epoch >= " << epoch
+	       << dendl;
+      mutate_peer_mdsmap_epochs([&](PeerMdsmapEpochMap& epochs) {
+        epochs[peer] = epoch;
+      });
+    }
   }
 
   // Validate ls_.state transitions while I hold a rank

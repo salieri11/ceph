@@ -26,6 +26,7 @@
 #include "include/common_fwd.h"
 
 #include "DamageTable.h"
+#include "CowSnapshot.h"
 #include "MDSMap.h"
 #include "SessionMap.h"
 #include "PurgeQueue.h"
@@ -202,8 +203,9 @@ class MDSRank {
       // ── Coordination ──────────────────────────────────────────────
       epoch_t osd_epoch_barrier = 0;
       ceph_tid_t last_tid = 0;
-      std::map<mds_rank_t, version_t> peer_mdsmap_epoch;
-      std::map<mds_rank_t, DecayCounter> export_targets;
+
+      // export_targets and peer_mdsmap_epoch moved to CoW snapshots
+      // on MDSRank (Phase 2) — read-mostly, lock-free snapshot access.
 
       // ── Heartbeat ─────────────────────────────────────────────────
       ceph::heartbeat_handle_d *hb = nullptr;
@@ -218,6 +220,28 @@ class MDSRank {
       bool client_eviction_dump = false;
     };
     LockedState ls_;
+
+    // Phase 2: read-mostly coordination state as CoW snapshots.
+    // Writers must hold mds_lock; readers may load snapshots lock-free.
+    using ExportTargetsMap = std::map<mds_rank_t, DecayCounter>;
+    using PeerMdsmapEpochMap = std::map<mds_rank_t, version_t>;
+    mds::CowSnapshot<ExportTargetsMap> export_targets_snap_;
+    mds::CowSnapshot<PeerMdsmapEpochMap> peer_mdsmap_epoch_snap_;
+
+    mds::CowSnapshot<ExportTargetsMap>::Snap read_export_targets() const {
+      return export_targets_snap_.read();
+    }
+    mds::CowSnapshot<PeerMdsmapEpochMap>::Snap read_peer_mdsmap_epochs() const {
+      return peer_mdsmap_epoch_snap_.read();
+    }
+    template<typename Mutator>
+    void mutate_export_targets(Mutator&& mutator) {
+      export_targets_snap_.mutate(std::forward<Mutator>(mutator));
+    }
+    template<typename Mutator>
+    void mutate_peer_mdsmap_epochs(Mutator&& mutator) {
+      peer_mdsmap_epoch_snap_.mutate(std::forward<Mutator>(mutator));
+    }
 
     CephContext *cct;
 
