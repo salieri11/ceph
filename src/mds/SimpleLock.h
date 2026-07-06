@@ -17,6 +17,8 @@
 #ifndef CEPH_SIMPLELOCK_H
 #define CEPH_SIMPLELOCK_H
 
+#include <atomic>
+#include <mutex>
 #include <ostream>
 #include <set>
 #include <string_view>
@@ -388,37 +390,57 @@ public:
       (get_sm()->states[state].can_xlock == XCL && client >= 0 && get_xlock_by_client() == client);
   }
 
-  // rdlock
+  // rdlock — guarded by rdlock_mutex_ so shard worker threads doing
+  // concurrent rdlock_start() on the same lock don't race on the
+  // check-then-act "if (!num_rdlock) parent->get()" sequence. A real
+  // mutex is used (not a busy-wait spinlock) so that under CPU
+  // oversubscription a spinning thread can't prevent the actual holder
+  // from being scheduled and starve the MDS heartbeat/tick thread.
   bool is_rdlocked() const { return num_rdlock > 0; }
-  int get_rdlock() { 
+  int get_rdlock() {
+    rdlock_mutex_.lock();
     if (!num_rdlock)
       parent->get(MDSCacheObject::PIN_LOCK);
-    return ++num_rdlock; 
+    int ret = ++num_rdlock;
+    rdlock_mutex_.unlock();
+    return ret;
   }
   int put_rdlock() {
+    rdlock_mutex_.lock();
     ceph_assert(num_rdlock>0);
     --num_rdlock;
-    if (num_rdlock == 0)
+    bool became_zero = (num_rdlock == 0);
+    int ret = num_rdlock;
+    rdlock_mutex_.unlock();
+    if (became_zero)
       parent->put(MDSCacheObject::PIN_LOCK);
-    return num_rdlock;
+    return ret;
   }
   int get_num_rdlocks() const {
     return num_rdlock;
   }
 
-  // wrlock
+  // wrlock — guarded by more_mutex_ (shared with more()'s lazy init) so
+  // shard workers touching wrlock/xlock on the same object don't race on
+  // the "if (num_wrlock == 0) parent->get()" check-then-act, or on the
+  // lazy allocation/deallocation of the `more()` unstable_bits_t block.
   void get_wrlock(bool force=false) {
     //assert(can_wrlock() || force);
-    if (more()->num_wrlock == 0)
+    more_spin_lock();
+    if (more_locked()->num_wrlock == 0)
       parent->get(MDSCacheObject::PIN_LOCK);
-    ++more()->num_wrlock;
+    ++more_locked()->num_wrlock;
+    more_spin_unlock();
   }
   void put_wrlock() {
-    --more()->num_wrlock;
-    if (more()->num_wrlock == 0) {
+    more_spin_lock();
+    --more_locked()->num_wrlock;
+    bool became_zero = (more_locked()->num_wrlock == 0);
+    if (became_zero)
+      try_clear_more_locked();
+    more_spin_unlock();
+    if (became_zero)
       parent->put(MDSCacheObject::PIN_LOCK);
-      try_clear_more();
-    }
   }
   bool is_wrlocked() const {
     return have_more() && more()->num_wrlock > 0;
@@ -636,7 +658,29 @@ private:
   unstable_bits_t *more() const;
   void try_clear_more();
 
+  // Raw (unlocked) variants — callers must hold more_spin_.  Used
+  // internally by get/put wrlock/xlock so the whole check-then-act
+  // sequence (including the lazy _unstable allocation/dealloc) is a
+  // single critical section, instead of racing across two more() calls.
+  unstable_bits_t *more_locked() const {
+    if (!_unstable)
+      _unstable.reset(new unstable_bits_t);
+    return _unstable.get();
+  }
+  void try_clear_more_locked() {
+    if (_unstable && _unstable->empty())
+      _unstable.reset();
+  }
+  void more_spin_lock() const {
+    more_mutex_.lock();
+  }
+  void more_spin_unlock() const {
+    more_mutex_.unlock();
+  }
+
   int num_rdlock = 0;
+  std::mutex rdlock_mutex_;
+  mutable std::mutex more_mutex_;
 
   mutable std::unique_ptr<unstable_bits_t> _unstable;
 };

@@ -45,6 +45,7 @@ void InoTable::reset_state()
 
 inodeno_t InoTable::project_alloc_id(inodeno_t id) 
 {
+  std::lock_guard l(alloc_mutex);
   dout(10) << "project_alloc_id " << id << " to " << projected_free << "/" << free << dendl;
   ceph_assert(is_active());
   if (!id)
@@ -55,6 +56,7 @@ inodeno_t InoTable::project_alloc_id(inodeno_t id)
 }
 void InoTable::apply_alloc_id(inodeno_t id)
 {
+  std::lock_guard l(alloc_mutex);
   dout(10) << "apply_alloc_id " << id << " to " << projected_free << "/" << free << dendl;
   free.erase(id);
   ++version;
@@ -62,6 +64,7 @@ void InoTable::apply_alloc_id(inodeno_t id)
 
 void InoTable::project_alloc_ids(interval_set<inodeno_t>& ids, int want) 
 {
+  std::lock_guard l(alloc_mutex);
   ceph_assert(is_active());
   while (want > 0) {
     inodeno_t start = projected_free.range_start();
@@ -78,6 +81,7 @@ void InoTable::project_alloc_ids(interval_set<inodeno_t>& ids, int want)
 }
 void InoTable::apply_alloc_ids(interval_set<inodeno_t>& ids)
 {
+  std::lock_guard l(alloc_mutex);
   dout(10) << "apply_alloc_ids " << ids << " to " << projected_free << "/" << free << dendl;
   free.subtract(ids);
   ++version;
@@ -86,12 +90,14 @@ void InoTable::apply_alloc_ids(interval_set<inodeno_t>& ids)
 
 void InoTable::project_release_ids(const interval_set<inodeno_t>& ids) 
 {
+  std::lock_guard l(alloc_mutex);
   dout(10) << "project_release_ids " << ids << " to " << projected_free << "/" << free << dendl;
   projected_free.insert(ids);
   ++projected_version;
 }
 void InoTable::apply_release_ids(const interval_set<inodeno_t>& ids) 
 {
+  std::lock_guard l(alloc_mutex);
   dout(10) << "apply_release_ids " << ids << " to " << projected_free << "/" << free << dendl;
   free.insert(ids);
   ++version;
@@ -190,7 +196,9 @@ void InoTable::dump(Formatter *f) const
 std::list<InoTable> InoTable::generate_test_instances()
 {
   std::list<InoTable> ls;
-  ls.push_back(InoTable());
+  // construct in place: InoTable now holds a non-copyable/movable
+  // alloc_mutex for shard safety, so it can't be pushed by value.
+  ls.emplace_back();
   return ls;
 }
 

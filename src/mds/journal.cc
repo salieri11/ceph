@@ -146,14 +146,22 @@ void LogSegment::try_to_expire(MDSRank *mds, MDSGatherBuilder &gather_bld, int o
     ceph_assert((*p)->is_auth());
     commit.insert((*p)->get_dir());
   }
-  for (elist<CInode*>::iterator p = dirty_inodes.begin(); !p.end(); ++p) {
-    dout(20) << " dirty_inode " << **p << dendl;
-    ceph_assert((*p)->is_auth());
-    if ((*p)->is_base()) {
-      (*p)->store(gather_bld.new_sub());
-    } else
-      commit.insert((*p)->get_parent_dn()->get_dir());
-  }
+  for_each_dirty_inode_locked([&](CInode *in) {
+    dout(20) << " dirty_inode " << *in << dendl;
+    ceph_assert(in->is_auth());
+    if (in->is_base()) {
+      in->store(gather_bld.new_sub());
+    } else if (mds->subvolume_parallel_poc_enabled() &&
+               in->get_subvolume_id() == in->ino()) {
+      // POC stops parent-dir propagation at subvolume roots; commit the
+      // root's own dirfrags so the segment can expire.  Do NOT call
+      // in->store() here — that is only valid for is_base() inodes.
+      for (const auto& dir : in->get_dirfrags())
+        commit.insert(dir);
+    } else {
+      commit.insert(in->get_parent_dn()->get_dir());
+    }
+  });
 
   if (!commit.empty()) {
     for (set<CDir*>::iterator p = commit.begin();
@@ -324,7 +332,7 @@ void LogSegment::try_to_expire(MDSRank *mds, MDSGatherBuilder &gather_bld, int o
 
   // updates to sessions for completed_requests
   mds->sessionmap.save_if_dirty(touched_sessions, &gather_bld);
-  touched_sessions.clear();
+  clear_touched_sessions_locked();
 
   // pending commit atids
   for (auto p = pending_commit_tids.begin();

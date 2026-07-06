@@ -17,6 +17,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
+#include <shared_mutex>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -216,16 +218,23 @@ class MDCache {
   explicit MDCache(MDSRank *m, PurgeQueue &purge_queue_);
   ~MDCache();
 
+  // taken_inos_mtx guards replay_taken_inos — touched from
+  // prepare_new_inode() (CREATE/MKDIR path) as well as replay, so two
+  // concurrent creates on different subvolumes could otherwise race here.
   void insert_taken_inos(inodeno_t ino) {
+    std::lock_guard l(taken_inos_mtx);
     replay_taken_inos.insert(ino);
   }
   void clear_taken_inos(inodeno_t ino) {
+    std::lock_guard l(taken_inos_mtx);
     replay_taken_inos.erase(ino);
   }
   bool test_and_clear_taken_inos(inodeno_t ino) {
+    std::lock_guard l(taken_inos_mtx);
     return replay_taken_inos.erase(ino) != 0;
   }
   bool is_taken_inos_empty(void) {
+    std::lock_guard l(taken_inos_mtx);
     return replay_taken_inos.empty();
   }
 
@@ -838,8 +847,9 @@ private:
       shutdown_export_strays();
   }
 
-  // inode_map
+  // inode_map — hot-path accessors take shared lock for shard safety
   bool have_inode(vinodeno_t vino) {
+    std::shared_lock l(inode_map_mtx);
     if (vino.snapid == CEPH_NOSNAP)
       return inode_map.count(vino.ino) ? true : false;
     else
@@ -849,6 +859,7 @@ private:
     return have_inode(vinodeno_t(ino, snap));
   }
   CInode* get_inode(vinodeno_t vino) {
+    std::shared_lock l(inode_map_mtx);
     if (vino.snapid == CEPH_NOSNAP) {
       auto p = inode_map.find(vino.ino);
       if (p != inode_map.end())
@@ -1127,6 +1138,7 @@ private:
   void show_subtrees(int dbl=10, bool force_print=false);
 
   CInode *hack_pick_random_inode() {
+    std::shared_lock l(inode_map_mtx);
     ceph_assert(!inode_map.empty());
     int n = rand() % inode_map.size();
     auto p = inode_map.begin();
@@ -1158,7 +1170,11 @@ private:
 
   int num_shadow_inodes = 0;
 
-  int num_inodes_with_caps = 0;
+  // Phase 5.3 groundwork: made atomic since add_client_cap()/
+  // remove_client_cap() can in principle run from different subvolume
+  // shard workers touching different inodes that share this global
+  // counter.  Not yet exercised by an active lock-free write path.
+  std::atomic<int> num_inodes_with_caps{0};
 
   unsigned max_dir_commit_size;
 
@@ -1170,7 +1186,9 @@ private:
   std::array<float, client_lease_pools> client_lease_durations{5.0, 30.0, 300.0};
 
   // -- client caps --
-  uint64_t last_cap_id = 0;
+  // Phase 5.3 groundwork: atomic for the same reason as
+  // num_inodes_with_caps above (assigning cap_id must never collide).
+  std::atomic<uint64_t> last_cap_id{0};
 
   std::map<ceph_tid_t, discover_info_t> discovers;
   ceph_tid_t discover_last_tid = 0;
@@ -1369,6 +1387,9 @@ private:
     return subvolume_inode_map.size();
   }
 
+  // Shard-safe inode lookup: readers take shared lock (parallel),
+  // writers (add_inode/remove_inode) take exclusive lock.
+  mutable std::shared_mutex inode_map_mtx;
   std::unordered_map<inodeno_t, CInode*> inode_map;  // map of head inodes by ino
   std::map<vinodeno_t, CInode*> snap_inode_map;  // map of snap inodes by ino
   CInode *root = nullptr; // root inode
@@ -1391,6 +1412,13 @@ private:
   std::map<CInode*,std::list<std::pair<CDir*,CDir*> > > projected_subtree_renames;  // renamed ino -> target dir
 
   // -- requests --
+  // active_requests_mtx guards active_requests against shard worker
+  // threads doing concurrent request_start/request_finish for different
+  // subvolumes.  Recovery/resolve/rejoin iteration sites are left
+  // unguarded: they only run while !is_active(), which is mutually
+  // exclusive with shard dispatch (classify_client_request requires
+  // is_active()).
+  mutable std::shared_mutex active_requests_mtx;
   std::unordered_map<metareqid_t, MDRequestRef> active_requests;
 
   // -- recovery --
@@ -1467,6 +1495,7 @@ private:
   };
 
   std::set<inodeno_t> replay_taken_inos; // the inos have been taken when replaying
+  mutable std::mutex taken_inos_mtx;
 
   // -- fragmenting --
   struct ufragment {

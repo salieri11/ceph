@@ -17,6 +17,7 @@
 #define CEPH_MDS_SNAPREALM_H
 
 #include <map>
+#include <mutex>
 #include <set>
 #include <string_view>
 
@@ -108,12 +109,22 @@ public:
   void split_at(SnapRealm *child);
   void merge_to(SnapRealm *newparent);
 
+  // Phase 6: cap_mtx guards client_caps and inodes_with_caps.  A SnapRealm
+  // can be shared across MULTIPLE subvolumes (any subvolume that hasn't
+  // created its own snapshot boundary inherits the global/root realm), so
+  // unlike CDir/CInode's projection stack this is NOT cleanly per-
+  // subvolume — use a single process-wide mutex, same pattern as
+  // Locker::revoking_caps_mtx.
+  static inline std::mutex cap_mtx;
+
   void add_cap(client_t client, Capability *cap) {
+    std::lock_guard l(cap_mtx);
     auto em = client_caps.emplace(cap->get_client(),
 				  member_offset(Capability, item_snaprealm_caps));
     em.first->second.push_back(&cap->item_snaprealm_caps);
   }
   void remove_cap(client_t client, Capability *cap) {
+    std::lock_guard l(cap_mtx);
     bool last_cap = cap->item_snaprealm_caps.is_singular();
     cap->item_snaprealm_caps.remove_myself();
     if (last_cap) {

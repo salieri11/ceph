@@ -481,6 +481,9 @@ void CInode::clear_dirty_rstat()
 CInode::projected_inode CInode::project_inode(const MutationRef& mut,
 					      bool xattr, bool snap)
 {
+  SubvolumeState::Guard shard_guard(
+    mdcache->mds->get_subvolume_state(get_subvolume_id()));
+
   if (mut && mut->is_projected(this)) {
     ceph_assert(!xattr && !snap);
     auto _inode = std::const_pointer_cast<mempool_inode>(projected_nodes.back().inode);
@@ -519,6 +522,9 @@ CInode::projected_inode CInode::project_inode(const MutationRef& mut,
 
 void CInode::pop_and_dirty_projected_inode(LogSegmentRef const& ls, const MutationRef& mut)
 {
+  SubvolumeState::Guard shard_guard(
+    mdcache->mds->get_subvolume_state(get_subvolume_id()));
+
   ceph_assert(!projected_nodes.empty());
   auto front = std::move(projected_nodes.front());
   dout(15) << __func__ << " v" << front.inode->version << dendl;
@@ -1174,6 +1180,9 @@ void CInode::name_stray_dentry(string& dname)
 
 version_t CInode::pre_dirty()
 {
+  SubvolumeState::Guard shard_guard(
+    mdcache->mds->get_subvolume_state(get_subvolume_id()));
+
   version_t pv;
   CDentry* _cdentry = get_projected_parent_dn(); 
   if (_cdentry) {
@@ -1194,6 +1203,9 @@ version_t CInode::pre_dirty()
 
 void CInode::_mark_dirty(LogSegmentRef const& ls)
 {
+  SubvolumeState::Guard shard_guard(
+    mdcache->mds->get_subvolume_state(get_subvolume_id()));
+
   if (!state_test(STATE_DIRTY)) {
     state_set(STATE_DIRTY);
     get(PIN_DIRTY);
@@ -1202,7 +1214,7 @@ void CInode::_mark_dirty(LogSegmentRef const& ls)
   
   // move myself to this segment's dirty list
   if (ls) 
-    ls->dirty_inodes.push_back(&item_dirty);
+    ls->mark_dirty_inode(this);
 }
 
 void CInode::mark_dirty(LogSegmentRef const& ls) {
@@ -1223,8 +1235,28 @@ void CInode::mark_dirty(LogSegmentRef const& ls) {
   _mark_dirty(ls);
 
   // mark dentry too
-  if (parent)
-    parent->mark_dirty(get_version(), ls);
+  if (parent) {
+    // Parallel sharding POC: predirty_journal_parents() deliberately
+    // stops calling project_inode()/project_fnode() once it reaches the
+    // subvolume root, to avoid touching the shared ancestor directory
+    // (e.g. .../_nogroup/) on every write. That means when THIS inode is
+    // the subvolume root itself, its parent CDir was never project_fnode
+    // ()'d for this mutation. Cascading into parent->mark_dirty() here
+    // would call CDir::mark_dirty() with a pv that was never pushed onto
+    // that CDir's projected_fnode queue, hitting its "pv must already be
+    // projected" assertion deterministically (not a race) on every
+    // mutation that touches the subvolume root. Skip the cascade in that
+    // specific case — consistent with already not propagating this
+    // inode's rstat/fragstat past the boundary either. The subvolume
+    // root's own linking dentry/dir simply won't be journaled dirty by
+    // internal-to-the-subvolume mutations; direct operations on the
+    // subvolume root itself (e.g. renaming it) aren't part of this POC's
+    // audited lock-free surface anyway.
+    if (!(mdcache->mds->subvolume_parallel_poc_enabled() &&
+          get_subvolume_id() == ino())) {
+      parent->mark_dirty(get_version(), ls);
+    }
+  }
 }
 
 
@@ -1236,7 +1268,7 @@ void CInode::mark_clean()
     put(PIN_DIRTY);
     
     // remove myself from ls dirty list
-    item_dirty.remove_myself();
+    LogSegment::unmark_dirty_inode(this);
   }
 }    
 
@@ -1599,7 +1631,7 @@ void CInode::mark_dirty_parent(LogSegmentRef const& ls, bool dirty_pool)
   if (dirty_pool)
     state_set(STATE_DIRTYPOOL);
   if (ls)
-    ls->dirty_parent_inodes.push_back(&item_dirty_parent);
+    ls->mark_dirty_parent_inode(this);
 }
 
 void CInode::clear_dirty_parent()
@@ -1609,7 +1641,7 @@ void CInode::clear_dirty_parent()
     state_clear(STATE_DIRTYPARENT);
     state_clear(STATE_DIRTYPOOL);
     put(PIN_DIRTYPARENT);
-    item_dirty_parent.remove_myself();
+    LogSegment::unmark_dirty_parent_inode(this);
   }
 }
 
@@ -2447,15 +2479,15 @@ void CInode::clear_dirty_scattered(int type)
   ceph_assert(is_dir());
   switch (type) {
   case CEPH_LOCK_IFILE:
-    item_dirty_dirfrag_dir.remove_myself();
+    LogSegment::unmark_dirty_dirfrag_dir(this);
     break;
 
   case CEPH_LOCK_INEST:
-    item_dirty_dirfrag_nest.remove_myself();
+    LogSegment::unmark_dirty_dirfrag_nest(this);
     break;
 
   case CEPH_LOCK_IDFT:
-    item_dirty_dirfrag_dirfragtree.remove_myself();
+    LogSegment::unmark_dirty_dirfrag_dirfragtree(this);
     break;
 
   default:
@@ -2577,7 +2609,7 @@ void CInode::finish_scatter_update(ScatterLock *lock, CDir *dir,
           }
 
           mdcache->mds->locker->mark_updated_scatterlock(&nestlock);
-          mut->ls->dirty_dirfrag_nest.push_back(&item_dirty_dirfrag_nest);
+          mut->ls->mark_dirty_dirfrag_nest(this);
         }
       }
 
@@ -3589,7 +3621,10 @@ Capability *CInode::add_client_cap(client_t client, Session *session,
       containing_realm = conrealm;
     else
       containing_realm = find_snaprealm();
-    containing_realm->inodes_with_caps.push_back(&item_caps);
+    {
+      std::lock_guard l(SnapRealm::cap_mtx);
+      containing_realm->inodes_with_caps.push_back(&item_caps);
+    }
     dout(10) << __func__ << " first cap, joining realm " << *containing_realm << dendl;
 
     mdcache->num_inodes_with_caps++;
@@ -3615,9 +3650,18 @@ void CInode::remove_client_cap(client_t client)
   ceph_assert(it != client_caps.end());
   Capability *cap = &it->second;
   
-  cap->item_session_caps.remove_myself();
-  cap->item_revoking_caps.remove_myself();
-  cap->item_client_revoking_caps.remove_myself();
+  if (Session *sess = cap->get_session()) {
+    sess->lock_caps();
+    cap->item_session_caps.remove_myself();
+    sess->unlock_caps();
+  } else {
+    cap->item_session_caps.remove_myself();
+  }
+  {
+    std::lock_guard rl(Locker::revoking_caps_mtx);
+    cap->item_revoking_caps.remove_myself();
+    cap->item_client_revoking_caps.remove_myself();
+  }
   containing_realm->remove_cap(client, cap);
   
   if (client == loner_cap)
@@ -3630,7 +3674,10 @@ void CInode::remove_client_cap(client_t client)
   if (client_caps.empty()) {
     dout(10) << __func__ << " last cap, leaving realm " << *containing_realm << dendl;
     put(PIN_CAPS);
-    item_caps.remove_myself();
+    {
+      std::lock_guard l(SnapRealm::cap_mtx);
+      item_caps.remove_myself();
+    }
     containing_realm = NULL;
     mdcache->num_inodes_with_caps--;
     if (parent)
@@ -3655,8 +3702,11 @@ void CInode::move_to_realm(SnapRealm *realm)
     containing_realm->remove_cap(p.first, &p.second);
     realm->add_cap(p.first, &p.second);
   }
-  item_caps.remove_myself();
-  realm->inodes_with_caps.push_back(&item_caps);
+  {
+    std::lock_guard l(SnapRealm::cap_mtx);
+    item_caps.remove_myself();
+    realm->inodes_with_caps.push_back(&item_caps);
+  }
   containing_realm = realm;
 }
 

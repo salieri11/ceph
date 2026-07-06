@@ -18,15 +18,16 @@
 #include "Mutation.h"
 
 SimpleLock::unstable_bits_t *SimpleLock::more() const {
-  if (!_unstable)
-    _unstable.reset(new unstable_bits_t);
-  return _unstable.get();
+  more_spin_lock();
+  auto *m = more_locked();
+  more_spin_unlock();
+  return m;
 }
 
 void SimpleLock::try_clear_more() {
-  if (_unstable && _unstable->empty()) {
-    _unstable.reset();
-  }
+  more_spin_lock();
+  try_clear_more_locked();
+  more_spin_unlock();
 }
 
 void SimpleLock::get_xlock(MutationRef who, client_t client) { 
@@ -34,18 +35,22 @@ void SimpleLock::get_xlock(MutationRef who, client_t client) {
   ceph_assert(state == LOCK_XLOCK || is_locallock() ||
 	      state == LOCK_LOCK /* if we are a peer */);
   parent->get(MDSCacheObject::PIN_LOCK);
-  more()->num_xlock++;
-  more()->xlock_by = who; 
-  more()->xlock_by_client = client;
+  more_spin_lock();
+  more_locked()->num_xlock++;
+  more_locked()->xlock_by = who;
+  more_locked()->xlock_by_client = client;
+  more_spin_unlock();
 }
 
 void SimpleLock::set_xlock_done() {
-  ceph_assert(more()->xlock_by);
   ceph_assert(state == LOCK_XLOCK || is_locallock() ||
 	      state == LOCK_LOCK /* if we are a peer */);
   if (!is_locallock())
     state = LOCK_XLOCKDONE;
-  more()->xlock_by.reset();
+  more_spin_lock();
+  ceph_assert(more_locked()->xlock_by);
+  more_locked()->xlock_by.reset();
+  more_spin_unlock();
 }
 
 void SimpleLock::put_xlock() {
@@ -54,13 +59,16 @@ void SimpleLock::put_xlock() {
 	      state == LOCK_LOCK  || /* if we are a leader of a peer */
 	      state == LOCK_PREXLOCK || state == LOCK_SYNC ||
 	      is_locallock());
-  --more()->num_xlock;
-  parent->put(MDSCacheObject::PIN_LOCK);
-  if (more()->num_xlock == 0) {
-    more()->xlock_by.reset();
-    more()->xlock_by_client = -1;
-    try_clear_more();
+  more_spin_lock();
+  --more_locked()->num_xlock;
+  bool became_zero = (more_locked()->num_xlock == 0);
+  if (became_zero) {
+    more_locked()->xlock_by.reset();
+    more_locked()->xlock_by_client = -1;
+    try_clear_more_locked();
   }
+  more_spin_unlock();
+  parent->put(MDSCacheObject::PIN_LOCK);
 }
 
 MutationRef SimpleLock::get_xlock_by() const {

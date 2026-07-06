@@ -5,7 +5,7 @@
 
 #include <map>
 
-#include "include/types.h"
+#include "include/fs_types.h"
 
 class MDSRank;
 

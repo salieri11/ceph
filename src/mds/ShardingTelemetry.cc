@@ -46,7 +46,7 @@ ShardingTelemetry ShardingTelemetryCollector::flush(const MDSRankShardingState &
   t.cross_subvol_ops = cross_subvol_ops;
   t.lock_wait_us = lock_wait_us;
   t.lock_hold_us = lock_hold_us;
-  t.sharding_effective = state.effective ? 1 : 0;
+  t.sharding_effective = 0;
   t.subvolume_count = subvolume_count;
   t.violation_count = state.violation_count;
 

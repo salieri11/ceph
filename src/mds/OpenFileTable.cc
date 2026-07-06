@@ -174,18 +174,21 @@ void OpenFileTable::put_ref(CInode *in, frag_t fg)
 
 void OpenFileTable::add_inode(CInode *in)
 {
+  std::lock_guard l(oft_mtx);
   dout(10) << __func__ << " " << *in << dendl;
   get_ref(in);
 }
 
 void OpenFileTable::remove_inode(CInode *in)
 {
+  std::lock_guard l(oft_mtx);
   dout(10) << __func__ << " " << *in << dendl;
   put_ref(in);
 }
 
 void OpenFileTable::add_dirfrag(CDir *dir)
 {
+  std::lock_guard l(oft_mtx);
   dout(10) << __func__ << " " << *dir << dendl;
   ceph_assert(!dir->state_test(CDir::STATE_TRACKEDBYOFT));
   dir->state_set(CDir::STATE_TRACKEDBYOFT);
@@ -194,6 +197,7 @@ void OpenFileTable::add_dirfrag(CDir *dir)
 
 void OpenFileTable::remove_dirfrag(CDir *dir)
 {
+  std::lock_guard l(oft_mtx);
   dout(10) << __func__ << " " << *dir << dendl;
   ceph_assert(dir->state_test(CDir::STATE_TRACKEDBYOFT));
   dir->state_clear(CDir::STATE_TRACKEDBYOFT);
@@ -202,6 +206,7 @@ void OpenFileTable::remove_dirfrag(CDir *dir)
 
 void OpenFileTable::notify_link(CInode *in)
 {
+  std::lock_guard l(oft_mtx);
   dout(10) << __func__ << " " << *in << dendl;
   auto p = anchor_map.find(in->ino());
   ceph_assert(p != anchor_map.end());
@@ -221,6 +226,7 @@ void OpenFileTable::notify_link(CInode *in)
 
 void OpenFileTable::notify_unlink(CInode *in)
 {
+  std::lock_guard l(oft_mtx);
   dout(10) << __func__ << " " << *in << dendl;
   auto p = anchor_map.find(in->ino());
   ceph_assert(p != anchor_map.end());
@@ -1226,6 +1232,7 @@ bool OpenFileTable::prefetch_inodes()
 
 bool OpenFileTable::should_log_open(CInode *in)
 {
+  std::lock_guard l(oft_mtx);
   if (in->state_test(CInode::STATE_TRACKEDBYOFT)) {
     // inode just journaled
     if (in->last_journaled >= committing_log_seq)

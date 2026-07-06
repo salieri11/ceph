@@ -134,6 +134,52 @@ public:
   void print(std::ostream& out) const override {
     out << "log_event(" << write_pos << ")";
   }
+
+  /**
+   * Phase 7: opt-in flag — MUST be overridden to return true by any
+   * class that has explicitly split its finish() logic into a
+   * finish_shard_local() safe for execution without mds_lock (see below).
+   * Defaults to false so that any NOT-yet-analyzed finish class used by
+   * a shard-dispatched write safely falls back to the normal mds_lock-
+   * protected async completion in Server::journal_and_reply(), instead
+   * of silently running unanalyzed logic without mds_lock.
+   */
+  virtual bool supports_shard_local() const { return false; }
+
+  /**
+   * Phase 7: alternate entry point used when a write was dispatched by a
+   * subvolume shard worker (see MDSRank::is_shard_dispatch_active() /
+   * Server::journal_and_reply()) AND supports_shard_local() returns true.
+   * Instead of scheduling this object's finish() to run later on the
+   * Finisher thread under mds_lock, the shard worker calls this
+   * directly, on its own thread, immediately after the journal write is
+   * confirmed durable (via a plain Context-based wait_for_safe(), which
+   * does not itself take mds_lock).
+   *
+   * IMPORTANT: this bypasses complete()'s mds_lock acquisition entirely.
+   * A class overriding this (and supports_shard_local()) is responsible
+   * for only touching state that is safe without mds_lock (see the
+   * Phase 6 fine-grained guards: CDir/CInode's SubvolumeState::Guard
+   * choke points, LogSegment's g_elist_mtx, OpenFileTable's oft_mtx,
+   * SnapRealm's cap_mtx, Locker's revoking_caps_mtx, Session's
+   * spinlocks, InoTable's alloc_mutex).  For anything NOT confidently
+   * covered, defer it via mds->queue_waiter() (already thread-safe,
+   * drains under mds_lock on the normal progress thread) instead of
+   * touching it directly here — see C_MDS_inode_update_finish for the
+   * reference split.
+   *
+   * Contract: implementations are responsible for eventually `delete`ing
+   * `this` — either immediately (if handled synchronously) or when a
+   * deferred continuation completes.  Callers of finish_shard_local()
+   * must NOT separately delete the object.  The default implementation
+   * here is never reached in practice (journal_and_reply() only calls
+   * finish_shard_local() when supports_shard_local() is true), but
+   * mirrors normal complete() semantics for safety.
+   */
+  virtual void finish_shard_local(int r) {
+    finish(r);
+    delete this;
+  }
 };
 
 /**

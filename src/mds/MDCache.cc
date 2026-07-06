@@ -374,16 +374,19 @@ static void remove_inode_from_subvolume_partition(
 
 void MDCache::add_inode(CInode *in)
 {
-  // add to inode map
-  if (in->last == CEPH_NOSNAP) {
-    auto &p = inode_map[in->ino()];
-    ceph_assert(!p); // should be no dup inos!
-    p = in;
-    add_inode_to_subvolume_partition(subvolume_inode_map, in);
-  } else {
-    auto &p = snap_inode_map[in->vino()];
-    ceph_assert(!p); // should be no dup inos!
-    p = in;
+  // add to inode map (exclusive lock for shard safety)
+  {
+    std::unique_lock l(inode_map_mtx);
+    if (in->last == CEPH_NOSNAP) {
+      auto &p = inode_map[in->ino()];
+      ceph_assert(!p);
+      p = in;
+      add_inode_to_subvolume_partition(subvolume_inode_map, in);
+    } else {
+      auto &p = snap_inode_map[in->vino()];
+      ceph_assert(!p);
+      p = in;
+    }
   }
 
   if (in->ino() < MDS_INO_SYSTEM_BASE) {
@@ -431,14 +434,20 @@ void MDCache::remove_inode(CInode *o)
 
   o->clear_ephemeral_pin(true, true);
 
-  // remove from inode map
-  if (o->last == CEPH_NOSNAP) {
-    remove_inode_from_subvolume_partition(subvolume_inode_map, o);
-    inode_map.erase(o->ino());
-  } else {
-    o->item_caps.remove_myself();
-    o->item_to_flush.remove_myself();
-    snap_inode_map.erase(o->vino());
+  // remove from inode map (exclusive lock for shard safety)
+  {
+    std::unique_lock l(inode_map_mtx);
+    if (o->last == CEPH_NOSNAP) {
+      remove_inode_from_subvolume_partition(subvolume_inode_map, o);
+      inode_map.erase(o->ino());
+    } else {
+      {
+        std::lock_guard cl(SnapRealm::cap_mtx);
+        o->item_caps.remove_myself();
+      }
+      o->item_to_flush.remove_myself();
+      snap_inode_map.erase(o->vino());
+    }
   }
 
   clear_taken_inos(o->ino());
@@ -1660,7 +1669,10 @@ CInode *MDCache::cow_inode(CInode *in, snapid_t last)
       auto client_snap_caps = std::move(in->client_snap_caps);
       in->client_snap_caps.clear();
       in->item_open_file.remove_myself();
-      in->item_caps.remove_myself();
+      {
+        std::lock_guard cl(SnapRealm::cap_mtx);
+        in->item_caps.remove_myself();
+      }
 
       if (!client_snap_caps.empty()) {
 	MDSContext::vec finished;
@@ -1845,7 +1857,7 @@ void MDCache::journal_cow_dentry(MutationImpl *mut, EMetaBlob *metablob,
       dout(10) << " olddn " << *olddn << dendl;
       bool need_snapflush = !oldin->client_snap_caps.empty();
       if (need_snapflush) {
-	mut->ls->open_files.push_back(&oldin->item_open_file);
+	mut->ls->mark_open_file(oldin);
 	mds->locker->mark_need_snapflush_inode(oldin);
       }
       olddn->set_projected_version(dir->get_projected_version());
@@ -2415,11 +2427,11 @@ void MDCache::predirty_journal_parents(MutationRef mut, EMetaBlob *blob,
     if (stop) {
       dout(10) << "predirty_journal_parents stop.  marking nestlock on " << *pin << dendl;
       mds->locker->mark_updated_scatterlock(&pin->nestlock);
-      mut->ls->dirty_dirfrag_nest.push_back(&pin->item_dirty_dirfrag_nest);
+      mut->ls->mark_dirty_dirfrag_nest(pin);
       mut->add_updated_lock(&pin->nestlock);
       if (do_parent_mtime || linkunlink) {
 	mds->locker->mark_updated_scatterlock(&pin->filelock);
-	mut->ls->dirty_dirfrag_dir.push_back(&pin->item_dirty_dirfrag_dir);
+	mut->ls->mark_dirty_dirfrag_dir(pin);
 	mut->add_updated_lock(&pin->filelock);
       }
       break;
@@ -2503,6 +2515,18 @@ void MDCache::predirty_journal_parents(MutationRef mut, EMetaBlob *blob,
     broadcast_quota_to_client(pin);
     if (pin->is_base())
       break;
+    // Parallel sharding POC: stop propagating dirty nested stats past the
+    // subvolume boundary.  This sacrifices global rstat/dirstat accuracy
+    // above the subvolume root, but is what actually decouples concurrent
+    // writes in different subvolumes from contending on shared ancestors
+    // (the real MDS root, volume root, etc).  Without this, every write
+    // anywhere in the tree always walks up to the same shared inodes.
+    if (mds->subvolume_parallel_poc_enabled() &&
+        pin->get_subvolume_id() == pin->ino()) {
+      dout(10) << "predirty_journal_parents POC: stopping propagation at "
+               << "subvolume root " << *pin << dendl;
+      break;
+    }
     // next parent!
     cur = pin;
     parentdn = pin->get_projected_parent_dn();
@@ -6682,7 +6706,7 @@ void MDCache::truncate_inode(CInode *in, LogSegmentRef const& ls)
 	   << " on " << *in
 	   << dendl;
 
-  ls->truncating_inodes.insert(in);
+  ls->insert_truncating_inode(in);
   in->get(CInode::PIN_TRUNCATING);
   in->auth_pin(this);
 
@@ -6873,9 +6897,8 @@ void MDCache::truncate_inode_finish(CInode *in, LogSegmentRef const& ls)
 {
   dout(10) << "truncate_inode_finish " << *in << dendl;
   
-  auto p = ls->truncating_inodes.find(in);
-  ceph_assert(p != ls->truncating_inodes.end());
-  ls->truncating_inodes.erase(p);
+  ceph_assert(ls->count_truncating_inode(in));
+  ls->erase_truncating_inode(in);
 
   MutationRef mut(new MutationImpl());
   mut->ls = mds->mdlog->get_current_segment();
@@ -6920,7 +6943,7 @@ void MDCache::add_recovered_truncate(CInode *in, LogSegmentRef const& ls)
 {
   dout(20) << "add_recovered_truncate " << *in << " in log segment "
 	   << ls->seq << "/" << ls->offset << dendl;
-  ls->truncating_inodes.insert(in);
+  ls->insert_truncating_inode(in);
   in->get(CInode::PIN_TRUNCATING);
 }
 
@@ -6929,9 +6952,8 @@ void MDCache::remove_recovered_truncate(CInode *in, LogSegmentRef const& ls)
   dout(20) << "remove_recovered_truncate " << *in << " in log segment "
 	   << ls->seq << "/" << ls->offset << dendl;
   // if we have the logseg the truncate started in, it must be in our list.
-  auto p = ls->truncating_inodes.find(in);
-  ceph_assert(p != ls->truncating_inodes.end());
-  ls->truncating_inodes.erase(p);
+  ceph_assert(ls->count_truncating_inode(in));
+  ls->erase_truncating_inode(in);
   in->put(CInode::PIN_TRUNCATING);
 }
 
@@ -7791,9 +7813,8 @@ void MDCache::standby_trim_segment(LogSegmentRef const& ls)
     in->dirfragtreelock.remove_dirty();
   }
   while (!ls->truncating_inodes.empty()) {
-    auto it = ls->truncating_inodes.begin();
-    CInode *in = *it;
-    ls->truncating_inodes.erase(it);
+    CInode *in = *ls->truncating_inodes.begin();
+    ls->erase_truncating_inode(in);
     in->put(CInode::PIN_TRUNCATING);
   }
 }
@@ -9927,6 +9948,7 @@ void MDCache::kick_find_ino_peers(mds_rank_t who)
 int MDCache::get_num_client_requests()
 {
   int count = 0;
+  std::shared_lock l(active_requests_mtx);
   for (auto p = active_requests.begin();
       p != active_requests.end();
       ++p) {
@@ -9939,6 +9961,7 @@ int MDCache::get_num_client_requests()
 
 MDRequestRef MDCache::request_start(const cref_t<MClientRequest>& req)
 {
+  std::unique_lock l(active_requests_mtx);
   // did we win a forward race against a peer?
   if (active_requests.count(req->get_reqid())) {
     MDRequestRef& mdr = active_requests[req->get_reqid()];
@@ -9984,8 +10007,11 @@ MDRequestRef MDCache::request_start_peer(metareqid_t ri, __u32 attempt, const cr
   params.dispatched = m->get_dispatch_stamp();
   MDRequestRef mdr =
       mds->op_tracker.create_request<MDRequestImpl,MDRequestImpl::Params*>(&params);
-  ceph_assert(active_requests.count(mdr->reqid) == 0);
-  active_requests[mdr->reqid] = mdr;
+  {
+    std::unique_lock l(active_requests_mtx);
+    ceph_assert(active_requests.count(mdr->reqid) == 0);
+    active_requests[mdr->reqid] = mdr;
+  }
   dout(7) << "request_start_peer " << *mdr << " by mds." << by << dendl;
   return mdr;
 }
@@ -10015,19 +10041,23 @@ MDRequestRef MDCache::request_start_internal(int op)
 
   MDRequestRef mdr = mds->op_tracker.create_request<MDRequestImpl,MDRequestImpl::Params*>(&params);
 
-  if (active_requests.count(mdr->reqid)) {
-    auto& _mdr = active_requests[mdr->reqid];
-    dout(0) << __func__ << " existing " << *_mdr << " op " << _mdr->internal_op << dendl;
-    dout(0) << __func__ << " new " << *mdr << " op " << op << dendl;
-    ceph_abort();
+  {
+    std::unique_lock l(active_requests_mtx);
+    if (active_requests.count(mdr->reqid)) {
+      auto& _mdr = active_requests[mdr->reqid];
+      dout(0) << __func__ << " existing " << *_mdr << " op " << _mdr->internal_op << dendl;
+      dout(0) << __func__ << " new " << *mdr << " op " << op << dendl;
+      ceph_abort();
+    }
+    active_requests[mdr->reqid] = mdr;
   }
-  active_requests[mdr->reqid] = mdr;
   dout(7) << __func__ << " " << *mdr << " op " << op << dendl;
   return mdr;
 }
 
 MDRequestRef MDCache::request_get(metareqid_t rid)
 {
+  std::shared_lock l(active_requests_mtx);
   auto p = active_requests.find(rid);
   ceph_assert(p != active_requests.end());
   dout(7) << "request_get " << rid << " " << *p->second << dendl;
@@ -10199,8 +10229,13 @@ void MDCache::request_cleanup(const MDRequestRef& mdr)
       mds->queue_waiters(mdr->more()->waiting_for_finish);
     uint64_t count = 0;
     for (auto& [in, reqid] : mdr->more()->quiesce_ops) {
-      if (auto it = active_requests.find(reqid); it != active_requests.end()) {
-        auto qimdr = it->second;
+      MDRequestRef qimdr;
+      {
+        std::shared_lock l(active_requests_mtx);
+        if (auto it = active_requests.find(reqid); it != active_requests.end())
+          qimdr = it->second;
+      }
+      if (qimdr) {
         dout(20) << "killing quiesce op " << *qimdr << dendl;
         request_kill(qimdr);
         if (!(++count % mds->heartbeat_reset_grace())) {
@@ -10241,10 +10276,19 @@ void MDCache::request_cleanup(const MDRequestRef& mdr)
   mdr->drop_pins();
 
   // remove from session
-  mdr->item_session_request.remove_myself();
+  if (Session *sess = mdr->session) {
+    sess->lock_requests();
+    mdr->item_session_request.remove_myself();
+    sess->unlock_requests();
+  } else {
+    mdr->item_session_request.remove_myself();
+  }
 
   // remove from map
-  active_requests.erase(mdr->reqid);
+  {
+    std::unique_lock l(active_requests_mtx);
+    active_requests.erase(mdr->reqid);
+  }
 
   // queue next replay op?
   if (mdr->is_queued_for_replay() && !mdr->get_queued_next_replay_op()) {
@@ -10284,8 +10328,14 @@ void MDCache::request_kill(const MDRequestRef& mdr)
     ceph_assert(mdr->used_prealloc_ino == 0);
     ceph_assert(mdr->prealloc_inos.empty());
 
+    if (Session *sess = mdr->session) {
+      sess->lock_requests();
+      mdr->item_session_request.remove_myself();
+      sess->unlock_requests();
+    } else {
+      mdr->item_session_request.remove_myself();
+    }
     mdr->session = NULL;
-    mdr->item_session_request.remove_myself();
     return;
   }
 
@@ -10306,7 +10356,13 @@ void MDCache::request_kill(const MDRequestRef& mdr)
 
   if (mdr->committing) {
     dout(10) << "request_kill " << *mdr << " -- already committing, remove it from sesssion requests" << dendl;
-    mdr->item_session_request.remove_myself();
+    if (Session *sess = mdr->session) {
+      sess->lock_requests();
+      mdr->item_session_request.remove_myself();
+      sess->unlock_requests();
+    } else {
+      mdr->item_session_request.remove_myself();
+    }
   } else {
     dout(10) << "request_kill " << *mdr << dendl;
     if (mdr->internal_op_finish) {
@@ -12556,19 +12612,19 @@ void MDCache::dispatch_fragment_dir(const MDRequestRef& mdr, bool abort_if_freez
     journal_dirty_inode(mdr.get(), &le->metablob, diri);
   } else {
     mds->locker->mark_updated_scatterlock(&diri->dirfragtreelock);
-    mdr->ls->dirty_dirfrag_dirfragtree.push_back(&diri->item_dirty_dirfrag_dirfragtree);
+    mdr->ls->mark_dirty_dirfrag_dirfragtree(diri);
     mdr->add_updated_lock(&diri->dirfragtreelock);
   }
 
   /*
   // filelock
   mds->locker->mark_updated_scatterlock(&diri->filelock);
-  mut->ls->dirty_dirfrag_dir.push_back(&diri->item_dirty_dirfrag_dir);
+  mut->ls->mark_dirty_dirfrag_dir(diri);
   mut->add_updated_lock(&diri->filelock);
 
   // dirlock
   mds->locker->mark_updated_scatterlock(&diri->nestlock);
-  mut->ls->dirty_dirfrag_nest.push_back(&diri->item_dirty_dirfrag_nest);
+  mut->ls->mark_dirty_dirfrag_nest(diri);
   mut->add_updated_lock(&diri->nestlock);
   */
 
@@ -12989,13 +13045,13 @@ void MDCache::rollback_uncommitted_fragments()
 	if (!(dir->get_fnode()->rstat == dir->get_fnode()->accounted_rstat)) {
 	  dout(10) << "    dirty nestinfo on " << *dir << dendl;
 	  mds->locker->mark_updated_scatterlock(&diri->nestlock);
-	  mut->ls->dirty_dirfrag_nest.push_back(&diri->item_dirty_dirfrag_nest);
+	  mut->ls->mark_dirty_dirfrag_nest(diri);
 	  mut->add_updated_lock(&diri->nestlock);
 	}
 	if (!(dir->get_fnode()->fragstat == dir->get_fnode()->accounted_fragstat)) {
 	  dout(10) << "    dirty fragstat on " << *dir << dendl;
 	  mds->locker->mark_updated_scatterlock(&diri->filelock);
-	  mut->ls->dirty_dirfrag_dir.push_back(&diri->item_dirty_dirfrag_dir);
+	  mut->ls->mark_dirty_dirfrag_dir(diri);
 	  mut->add_updated_lock(&diri->filelock);
 	}
 
@@ -13018,7 +13074,7 @@ void MDCache::rollback_uncommitted_fragments()
       le->metablob.add_primary_dentry(diri->get_projected_parent_dn(), diri, true);
     } else {
       mds->locker->mark_updated_scatterlock(&diri->dirfragtreelock);
-      mut->ls->dirty_dirfrag_dirfragtree.push_back(&diri->item_dirty_dirfrag_dirfragtree);
+      mut->ls->mark_dirty_dirfrag_dirfragtree(diri);
       mut->add_updated_lock(&diri->dirfragtreelock);
     }
 
@@ -13846,7 +13902,7 @@ void MDCache::repair_dirfrag_stats_work(const MDRequestRef& mdr)
       frag_info.change_attr = pf->fragstat.change_attr;
     _pf->fragstat = frag_info;
     mds->locker->mark_updated_scatterlock(&diri->filelock);
-    mdr->ls->dirty_dirfrag_dir.push_back(&diri->item_dirty_dirfrag_dir);
+    mdr->ls->mark_dirty_dirfrag_dir(diri);
     mdr->add_updated_lock(&diri->filelock);
   }
 
@@ -13855,7 +13911,7 @@ void MDCache::repair_dirfrag_stats_work(const MDRequestRef& mdr)
       nest_info.rctime = pf->rstat.rctime;
     _pf->rstat = nest_info;
     mds->locker->mark_updated_scatterlock(&diri->nestlock);
-    mdr->ls->dirty_dirfrag_nest.push_back(&diri->item_dirty_dirfrag_nest);
+    mdr->ls->mark_dirty_dirfrag_nest(diri);
     mdr->add_updated_lock(&diri->nestlock);
   }
 
@@ -13928,9 +13984,9 @@ void MDCache::repair_inode_stats_work(const MDRequestRef& mdr)
   diri->state_set(CInode::STATE_REPAIRSTATS);
   mdr->ls = mds->mdlog->get_current_segment();
   mds->locker->mark_updated_scatterlock(&diri->filelock);
-  mdr->ls->dirty_dirfrag_dir.push_back(&diri->item_dirty_dirfrag_dir);
+  mdr->ls->mark_dirty_dirfrag_dir(diri);
   mds->locker->mark_updated_scatterlock(&diri->nestlock);
-  mdr->ls->dirty_dirfrag_nest.push_back(&diri->item_dirty_dirfrag_nest);
+  mdr->ls->mark_dirty_dirfrag_nest(diri);
 
   mds->locker->drop_locks(mdr.get());
 

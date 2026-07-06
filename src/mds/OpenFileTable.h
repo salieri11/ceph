@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -58,7 +59,19 @@ public:
   void remove_dirfrag(CDir *dir);
   void notify_link(CInode *in);
   void notify_unlink(CInode *in);
-  bool is_any_dirty() const { return !dirty_items.empty(); }
+  bool is_any_dirty() const {
+    std::lock_guard l(oft_mtx);
+    return !dirty_items.empty();
+  }
+
+  // Phase 6: guards anchor_map/dirty_items — reachable from
+  // CInode::mark_clientwriteable/CDir::adjust_num_inodes_with_caps
+  // (add_dirfrag/remove_dirfrag), which shard workers can call without
+  // mds_lock.  Only the PUBLIC entry points below take this lock (not
+  // the protected get_ref/put_ref helpers they call internally) to avoid
+  // self-deadlock on the non-recursive mutex from nested calls (e.g.
+  // notify_link calling get_ref).
+  mutable std::mutex oft_mtx;
 
   void commit(MDSContext *c, uint64_t log_seq, int op_prio);
   uint64_t get_committed_log_seq() const { return committed_log_seq; }

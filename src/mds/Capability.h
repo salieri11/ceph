@@ -17,6 +17,8 @@
 #ifndef CEPH_CAPABILITY_H
 #define CEPH_CAPABILITY_H
 
+#include <mutex>
+
 #include "include/buffer_fwd.h"
 #include "include/ceph_fs.h" // for CEPH_CAP_*
 #include "include/counter.h"
@@ -148,63 +150,28 @@ public:
   int revoking() const {
     return _issued & ~_pending;
   }
-  ceph_seq_t issue(unsigned c, bool reval=false) {
-    if (reval)
-      revalidate();
-
-    if (_pending & ~c) {
-      // revoking (and maybe adding) bits.  note caps prior to this revocation
-      _revokes.emplace_back(_pending, last_sent, last_issue);
-      _pending = c;
-      _issued |= c;
-      if (!is_notable())
-	mark_notable();
-    } else if (~_pending & c) {
-      // adding bits only.  remove obsolete revocations?
-      _pending |= c;
-      _issued |= c;
-      // drop old _revokes with no bits we don't have
-      while (!_revokes.empty() &&
-	     (_revokes.back().before & ~_pending) == 0)
-	_revokes.pop_back();
-    } else {
-      // no change.
-      ceph_assert(_pending == c);
-    }
-    //last_issue = 
-    inc_last_seq();
-    return last_sent;
-  }
-  ceph_seq_t issue_norevoke(unsigned c, bool reval=false) {
-    if (reval)
-      revalidate();
-
-    _pending |= c;
-    _issued |= c;
-    clear_new();
-
-    inc_last_seq();
-    return last_sent;
-  }
+  // issue()/issue_norevoke()/confirm_receipt()/clean_revoke_from() are all
+  // out-of-line (see Capability.cc) and take state_mtx_ around their
+  // bodies. This whole cluster of fields (_pending, _issued, _revokes,
+  // last_sent, last_issue, notable state) is mutated as a unit by these
+  // functions, and — under the parallel sharding POC — issue() can run on
+  // the mds_lock path (cap issuance/recall/eval, migration) at the same
+  // time confirm_receipt()/clean_revoke_from() run lock-free on a shard
+  // worker handling this same cap's client ack/flush. A plain per-list
+  // mutex (like Locker::revoking_caps_mtx, which only covers the
+  // item_revoking_caps/item_client_revoking_caps elist membership) isn't
+  // enough on its own: _revokes itself, and the _pending/_issued bits
+  // read-modify-written alongside it, need the same protection.
+  ceph_seq_t issue(unsigned c, bool reval=false);
+  ceph_seq_t issue_norevoke(unsigned c, bool reval=false);
   int confirm_receipt(ceph_seq_t seq, unsigned caps);
   // we may get a release racing with revocations, which means our revokes will be ignored
   // by the client.  clean them out of our _revokes history so we don't wait on them.
-  void clean_revoke_from(ceph_seq_t li) {
-    bool changed = false;
-    while (!_revokes.empty() && _revokes.front().last_issue <= li) {
-      _revokes.pop_front();
-      changed = true;
-    }
-    if (changed) {
-      bool was_revoking = (_issued & ~_pending);
-      calc_issued();
-      if (was_revoking && _issued == _pending) {
-	item_revoking_caps.remove_myself();
-	item_client_revoking_caps.remove_myself();
-	maybe_clear_notable();
-      }
-    }
-  }
+  // Out-of-line (see Capability.cc) because it needs to take
+  // Locker::revoking_caps_mtx around the item_revoking_caps/
+  // item_client_revoking_caps removal — including Locker.h from this
+  // header would risk a circular include.
+  void clean_revoke_from(ceph_seq_t li);
   ceph_seq_t get_mseq() const { return mseq; }
   void inc_mseq() { mseq++; }
 
@@ -246,7 +213,12 @@ public:
   void clear_needsnapflush() { state &= ~STATE_NEEDSNAPFLUSH; }
 
   bool is_clientwriteable() const { return state & STATE_CLIENTWRITEABLE; }
+  // Guarded by state_mtx_ (see the comment above issue()) — cap-flush
+  // handling (Locker::handle_client_caps(), lock-free on a shard worker)
+  // calls these on the same Capability that Locker::eval()/issue_caps()
+  // (mds_lock path) can touch concurrently.
   void mark_clientwriteable() {
+    std::lock_guard l(state_mtx_);
     if (!is_clientwriteable()) {
       state |= STATE_CLIENTWRITEABLE;
       if (!is_notable())
@@ -254,6 +226,7 @@ public:
     }
   }
   void clear_clientwriteable() {
+    std::lock_guard l(state_mtx_);
     if (is_clientwriteable()) {
       state &= ~STATE_CLIENTWRITEABLE;
       maybe_clear_notable();
@@ -377,6 +350,9 @@ private:
   //  - track revocations in _revokes list
   __u32 _pending = 0, _issued = 0;
   mempool::mds_co::list<revoke_info> _revokes;
+  // Guards _pending/_issued/_revokes/last_sent/last_issue/notable-state —
+  // see the comment on issue()/confirm_receipt() above.
+  mutable std::mutex state_mtx_;
 
   ceph_seq_t last_sent = 0;
   ceph_seq_t last_issue = 0;

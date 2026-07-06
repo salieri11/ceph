@@ -18,6 +18,10 @@
 #include "RetryRequest.h"
 #include "BatchOp.h"
 
+#include <condition_variable>
+#include <mutex>
+#include "include/Context.h"
+
 #include <boost/lexical_cast.hpp>
 #include "include/ceph_assert.h"  // lexical_cast includes system assert.h
 #include "include/cephfs/metrics/Types.h"
@@ -41,6 +45,7 @@
 #include "MetricsHandler.h"
 #include "cephfs_features.h"
 #include "MDSContext.h"
+#include "SubvolumeState.h"
 
 #include "messages/MClientReconnect.h"
 #include "messages/MClientReply.h"
@@ -2128,7 +2133,68 @@ void Server::journal_and_reply(const MDRequestRef& mdr, CInode *in, CDentry *dn,
   early_reply(mdr, in, dn);
   
   mdr->committing = true;
-  submit_mdlog_entry(le, fin, mdr, __func__);
+
+  if (mds->is_shard_dispatch_active() && fin && fin->supports_shard_local()) {
+    // Phase 7: this write was dispatched by a subvolume shard worker
+    // without mds_lock, AND `fin`'s class has explicitly opted in (see
+    // MDSLogContextBase::supports_shard_local()) by splitting its
+    // finish() logic into a shard-safe finish_shard_local().  Instead of
+    // letting `fin` run later as an mds_lock-protected async completion
+    // on the Finisher thread (which would serialize this subvolume's
+    // write against every OTHER subvolume's completion on the single
+    // global mds_lock), run it on THIS thread, right after the journal
+    // write is confirmed durable.
+    //
+    // Finish classes that have NOT opted in fall through to the `else`
+    // branch below even when shard-dispatched, so unanalyzed finish
+    // logic never silently runs without mds_lock.
+    //
+    // Submit with no per-event completion (nullptr is an already-
+    // supported fire-and-forget mode in MDLog), then block via a plain
+    // (non-MDSContext) Context so the wait itself never touches
+    // mds_lock, then invoke fin->finish_shard_local() — which is
+    // responsible for only touching state covered by Phase 6's guards,
+    // deferring anything else via mds->queue_waiter().
+    // Submit the log entry with no per-event completion (fire-and-forget
+    // as far as submit_entry is concerned).
+    submit_mdlog_entry(le, nullptr, mdr, __func__);
+
+    // Projection/submit is done; release the sticky boundary lock before
+    // blocking.  Holding g_boundary_mutex across wait_for_flush deadlocks
+    // with the main mds thread (mds_lock -> boundary) vs this thread
+    // (boundary -> journal callback -> finisher needing mds_lock).
+    SubvolumeState::exit_sticky_boundary_mode();
+
+    // Block until the journal write is durable.  We must use
+    // Journaler::wait_for_flush() directly with a plain Context (NOT
+    // via MDLog::wait_for_safe()), because wait_for_safe wraps the
+    // callback in C_IO_Wrapper / MDSIOContextBase which takes mds_lock
+    // on completion — and we're currently holding shard_lock on the
+    // shard worker thread.  If the mds_lock-holding thread (tick,
+    // trim, UNLINK, etc.) ever needs this subvolume's shard_lock (via
+    // SubvolumeState::Guard in any mark_dirty/projection function),
+    // we'd deadlock: shard worker holds shard_lock, waiting for
+    // journal callback that needs mds_lock; mds_lock holder waiting
+    // for shard_lock.  Using Journaler::wait_for_flush directly
+    // with a plain LambdaContext avoids the mds_lock dependency
+    // entirely — the callback fires on the Objecter/Finisher thread
+    // without touching any MDS-level lock.
+    std::mutex done_mutex;
+    std::condition_variable done_cond;
+    bool done = false;
+    mdlog->get_journaler()->wait_for_flush(new LambdaContext([&](int) {
+      std::lock_guard dl(done_mutex);
+      done = true;
+      done_cond.notify_one();
+    }));
+    {
+      std::unique_lock dl(done_mutex);
+      done_cond.wait(dl, [&] { return done; });
+    }
+    fin->finish_shard_local(0);
+  } else {
+    submit_mdlog_entry(le, fin, mdr, __func__);
+  }
   
   if (mdr->is_queued_for_replay()) {
 
@@ -2387,7 +2453,7 @@ void Server::reply_client_request(const MDRequestRef& mdr, const ref_t<MClientRe
     inodeno_t created = mdr->alloc_ino ? mdr->alloc_ino : mdr->used_prealloc_ino;
     session->add_completed_request(mdr->reqid.tid, created);
     if (mdr->ls) {
-      mdr->ls->touched_sessions.insert(session->info.inst.name);
+      mdr->ls->add_touched_session(session->info.inst.name);
     }
   }
 
@@ -2556,7 +2622,7 @@ void Server::trim_completed_request_list(ceph_tid_t tid, Session *session)
   if (session->trim_completed_requests(tid)) {
     // Sessions 'completed_requests' was dirtied, mark it to be
     // potentially flushed at segment expiry.
-    mdlog->get_current_segment()->touched_sessions.insert(session->info.inst.name);
+    mdlog->get_current_segment()->add_touched_session(session->info.inst.name);
 
     if (session->get_num_trim_requests_warnings() > 0 &&
         session->get_num_completed_requests() * 2 < g_conf()->mds_max_completed_requests)
@@ -2694,7 +2760,9 @@ void Server::handle_client_request(const cref_t<MClientRequest> &req)
 
   if (session) {
     mdr->session = session;
+    session->lock_requests();
     session->requests.push_back(&mdr->item_session_request);
+    session->unlock_requests();
   }
 
   if (has_completed)
@@ -4779,6 +4847,23 @@ public:
   C_MDS_openc_finish(Server *s, const MDRequestRef& r, CDentry *d, CInode *ni) :
     ServerLogContext(s, r), dn(d), newi(ni) {}
   void finish(int r) override {
+    finish_local(r);
+    finish_deferred();
+  }
+
+  bool supports_shard_local() const override { return true; }
+
+  void finish_shard_local(int r) override {
+    finish_local(r);
+    MDSRank *mds = get_mds();
+    mds->queue_waiter(new MDSInternalContextWrapper(mds, new LambdaContext([this](int) {
+      finish_deferred();
+      delete this;
+    })));
+  }
+
+private:
+  void finish_local(int r) {
     ceph_assert(r == 0);
 
     // crash current MDS and the replacing MDS will test the journal
@@ -4792,16 +4877,19 @@ public:
 
     mdr->apply();
 
+    // reply
+    server->respond_to_request(mdr, 0);
+
+    ceph_assert(g_conf()->mds_kill_openc_at != 1);
+  }
+
+  void finish_deferred() {
     get_mds()->locker->share_inode_max_size(newi);
 
     MDRequestRef null_ref;
     get_mds()->mdcache->send_dentry_link(dn, null_ref);
 
     get_mds()->balancer->hit_inode(newi, META_POP_IWR);
-
-    server->respond_to_request(mdr, 0);
-
-    ceph_assert(g_conf()->mds_kill_openc_at != 1);
   }
 };
 
@@ -5295,32 +5383,62 @@ public:
     ServerLogContext(s, r), in(i),
     truncating_smaller(sm), changed_ranges(cr), adjust_realm(ar) { }
   void finish(int r) override {
+    finish_local(r);
+    finish_deferred();
+  }
+
+  bool supports_shard_local() const override { return true; }
+
+  // Phase 7: split for shard-local execution (see MDSLogContextBase::
+  // finish_shard_local()).  finish_local() only touches state covered by
+  // Phase 6's fine-grained guards (mdr->apply() -> CDir/CInode's
+  // SubvolumeState::Guard choke points; per-inode cap issuance ->
+  // Locker::revoking_caps_mtx / Session spinlocks; reply/session
+  // completion -> active_requests_mtx / Session spinlocks) and is safe
+  // to run on the shard worker thread without mds_lock.  finish_deferred()
+  // covers the less-audited pieces (truncate-on-shrink OSD I/O kickoff,
+  // snap realm invalidation notify, balancer decay-counter hit) and is
+  // pushed through mds->queue_waiter() to run later, unchanged, under
+  // mds_lock on the normal progress thread — exactly as it did before
+  // this split existed.
+  void finish_shard_local(int r) override {
+    finish_local(r);
+    MDSRank *mds = get_mds();
+    mds->queue_waiter(new MDSInternalContextWrapper(mds, new LambdaContext([this](int) {
+      finish_deferred();
+      delete this;
+    })));
+  }
+
+private:
+  void finish_local(int r) {
     ceph_assert(r == 0);
-
-    int snap_op = (in->snaprealm ? CEPH_SNAP_OP_UPDATE : CEPH_SNAP_OP_SPLIT);
-
     // apply
     mdr->apply();
 
     MDSRank *mds = get_mds();
-
-    // notify any clients
-    if (truncating_smaller && in->get_inode()->is_truncating()) {
+    if (truncating_smaller && in->get_inode()->is_truncating())
       mds->locker->issue_truncate(in);
+
+    server->respond_to_request(mdr, 0);
+
+    if (changed_ranges)
+      mds->locker->share_inode_max_size(in);
+  }
+
+  void finish_deferred() {
+    MDSRank *mds = get_mds();
+    int snap_op = (in->snaprealm ? CEPH_SNAP_OP_UPDATE : CEPH_SNAP_OP_SPLIT);
+
+    if (truncating_smaller && in->get_inode()->is_truncating())
       mds->mdcache->truncate_inode(in, mdr->ls);
-    }
 
     if (adjust_realm) {
       mds->mdcache->send_snap_update(in, 0, snap_op);
       mds->mdcache->do_realm_invalidate_and_update_notify(in, snap_op);
     }
 
-    get_mds()->balancer->hit_inode(in, META_POP_IWR);
-
-    server->respond_to_request(mdr, 0);
-
-    if (changed_ranges)
-      get_mds()->locker->share_inode_max_size(in);
+    mds->balancer->hit_inode(in, META_POP_IWR);
   }
 };
 
@@ -7440,6 +7558,23 @@ public:
   C_MDS_mknod_finish(Server *s, const MDRequestRef& r, CDentry *d, CInode *ni) :
     ServerLogContext(s, r), dn(d), newi(ni) {}
   void finish(int r) override {
+    finish_local(r);
+    finish_deferred();
+  }
+
+  bool supports_shard_local() const override { return true; }
+
+  void finish_shard_local(int r) override {
+    finish_local(r);
+    MDSRank *mds = get_mds();
+    mds->queue_waiter(new MDSInternalContextWrapper(mds, new LambdaContext([this](int) {
+      finish_deferred();
+      delete this;
+    })));
+  }
+
+private:
+  void finish_local(int r) {
     ceph_assert(r == 0);
 
     // crash current MDS and the replacing MDS will test the journal
@@ -7464,21 +7599,22 @@ public:
 
     mdr->apply();
 
+    // reply
+    server->respond_to_request(mdr, 0);
+  }
+
+  void finish_deferred() {
     MDRequestRef null_ref;
     get_mds()->mdcache->send_dentry_link(dn, null_ref);
 
     if (newi->is_file()) {
       get_mds()->locker->share_inode_max_size(newi);
     } else if (newi->is_dir()) {
-      // We do this now so that the linkages on the new directory are stable.
       newi->maybe_ephemeral_rand();
     }
 
     // hit pop
     get_mds()->balancer->hit_inode(newi, META_POP_IWR);
-
-    // reply
-    server->respond_to_request(mdr, 0);
   }
 };
 

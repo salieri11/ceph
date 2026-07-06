@@ -16,7 +16,10 @@
 #include "MDSRank.h"
 #include "osdc/Journaler.h"
 
+#include <condition_variable>
+#include <mutex>
 #include <typeinfo>
+#include "include/Context.h"
 #include "common/DecayCounter.h"
 #include "common/debug.h"
 #include "common/errno.h"
@@ -28,6 +31,7 @@
 #include "common/cmdparse.h"
 #include "log/Log.h"
 
+#include "messages/MClientCaps.h"
 #include "messages/MClientRequest.h"
 #include "messages/MClientRequestForward.h"
 #include "messages/MMDSLoadTargets.h"
@@ -809,6 +813,8 @@ void MDSRankDispatcher::shutdown()
   ceph_assert(ls_.stopping == false);
   ls_.stopping = true;
 
+  shutdown_subvolume_workers();
+
   dout(1) << __func__ << ": shutting down rank " << whoami << dendl;
 
   g_conf().remove_observer(this);
@@ -1001,8 +1007,13 @@ void *MDSRank::ProgressThread::entry()
   std::unique_lock l(mds->mds_lock);
   while (true) {
     cond.wait(l, [this] {
+      bool finished_nonempty;
+      {
+        std::lock_guard fl(mds->finished_queue_mtx);
+        finished_nonempty = !mds->ls_.finished_queue.empty();
+      }
       return (mds->ls_.stopping ||
-	      !mds->ls_.finished_queue.empty() ||
+	      finished_nonempty ||
 	      (!mds->ls_.waiting_for_nolaggy.empty() && !mds->beacon.is_laggy()));
     });
 
@@ -1084,7 +1095,7 @@ bool MDSRank::_dispatch(const cref_t<Message> &m, bool new_msg)
     heartbeat_reset();
   }
 
-  if (ls_.dispatch_depth > 1)
+  if (tl_dispatch_depth_ > 1)
     return true;
 
   // finish any triggered contexts
@@ -1325,11 +1336,19 @@ void MDSRank::_advance_queues()
 {
   ceph_assert(dispatch_mutex_is_locked_by_me());
 
-  if (!ls_.finished_queue.empty()) {
-    dout(7) << "mds has " << ls_.finished_queue.size() << " queued contexts" << dendl;
-    while (!ls_.finished_queue.empty()) {
-      auto fin = ls_.finished_queue.front();
-      ls_.finished_queue.pop_front();
+  while (true) {
+    std::deque<MDSContext*> batch;
+    {
+      std::lock_guard l(finished_queue_mtx);
+      if (ls_.finished_queue.empty()) {
+        break;
+      }
+      batch.swap(ls_.finished_queue);
+    }
+    dout(7) << "mds has " << batch.size() << " queued contexts" << dendl;
+    while (!batch.empty()) {
+      auto fin = batch.front();
+      batch.pop_front();
 
       dout(10) << " finish " << fin << dendl;
       fin->complete(0);
@@ -2168,6 +2187,7 @@ void MDSRank::active_start()
   finish_contexts(g_ceph_context, ls_.waiting_for_active);  // kick waiters
 
   populate_subvolume_registry();
+  start_subvolume_workers();
 
   quiesce_agent_setup();
 }
@@ -2547,7 +2567,7 @@ void MDSRankDispatcher::handle_mds_map(
   {
     std::vector<mds_rank_t> erase;
     for (auto& [rank, queue] : ls_.waiting_for_bootstrapping_peer) {
-      auto state = mdsmap->get_state(rank);
+      [[maybe_unused]] auto state = mdsmap->get_state(rank);
       if (ls_.state > MDSMap::STATE_REPLAY) {
         queue_waiters(queue);
         erase.push_back(rank);
@@ -4396,11 +4416,22 @@ void MDSRank::register_subvolume(inodeno_t subvol_ino)
   if (!subvol_ino) {
     return;
   }
-  subvolume_states_.try_emplace(subvol_ino, SubvolumeState(subvol_ino));
-  sharding_state_.subvolume_count = subvolume_states_.size();
+  SubvolumeState *sv;
+  size_t registry_size;
+  {
+    std::unique_lock l(subvolume_states_mtx_);
+    auto [it, inserted] = subvolume_states_.try_emplace(
+      subvol_ino, std::make_unique<SubvolumeState>(subvol_ino));
+    sv = it->second.get();
+    registry_size = subvolume_states_.size();
+  }
+  if (subvolume_parallel_poc_enabled()) {
+    sv->start_dispatch_worker(this);
+  }
+  sharding_state_.subvolume_count = registry_size;
   sharding_telemetry_.set_subvolume_count(sharding_state_.subvolume_count);
   dout(10) << __func__ << " subvol_ino=" << subvol_ino
-           << " registry_size=" << subvolume_states_.size() << dendl;
+           << " registry_size=" << registry_size << dendl;
 }
 
 void MDSRank::deregister_subvolume(inodeno_t subvol_ino)
@@ -4409,11 +4440,16 @@ void MDSRank::deregister_subvolume(inodeno_t subvol_ino)
   if (!subvol_ino) {
     return;
   }
-  subvolume_states_.erase(subvol_ino);
-  sharding_state_.subvolume_count = subvolume_states_.size();
+  size_t registry_size;
+  {
+    std::unique_lock l(subvolume_states_mtx_);
+    subvolume_states_.erase(subvol_ino);
+    registry_size = subvolume_states_.size();
+  }
+  sharding_state_.subvolume_count = registry_size;
   sharding_telemetry_.set_subvolume_count(sharding_state_.subvolume_count);
   dout(10) << __func__ << " subvol_ino=" << subvol_ino
-           << " registry_size=" << subvolume_states_.size() << dendl;
+           << " registry_size=" << registry_size << dendl;
 }
 
 void MDSRank::populate_subvolume_registry()
@@ -4422,7 +4458,7 @@ void MDSRank::populate_subvolume_registry()
   for (auto ino : mdcache->get_subvolume_inos()) {
     register_subvolume(ino);
   }
-  dout(1) << __func__ << " populated " << subvolume_states_.size()
+  dout(1) << __func__ << " populated " << get_subvolume_states().size()
           << " subvolume(s)" << dendl;
 }
 
@@ -4443,7 +4479,7 @@ ClientRequestClassification MDSRank::classify_client_request(
     primary = subvol_for_path(mdcache, req->get_filepath());
   }
 
-  if (!primary || !subvolume_states_.count(primary)) {
+  if (!primary || !get_subvolume_state(primary)) {
     return result;
   }
 
@@ -4458,6 +4494,58 @@ ClientRequestClassification MDSRank::classify_client_request(
 
   result.cls = ShardingClass::Shardable;
   result.subvol_ino = primary;
+  result.read_only = !req->may_write();
+  // Phase 5.2 (2026-07-04, re-enabled under Phase 6): SETATTR was briefly
+  // made lock-free, then reverted after a reproduced crash — two sibling
+  // files' writes in the same parent directory raced on the unguarded
+  // CDir::projected_fnode queue (a lock-free shard worker vs. the
+  // mds_lock-path CREATE/MKNOD journal-completion finish, running on the
+  // Finisher thread). Root cause fixed by Phase 6: CDir/CInode's
+  // projection-stack functions (project_fnode/project_inode/pre_dirty/
+  // mark_dirty/pop_and_dirty_projected_*) now take the target's subvolume
+  // shard_lock internally (SubvolumeState::Guard, reentrant-safe),
+  // regardless of caller (mds_lock or shard_lock context) — see CDir.cc/
+  // CInode.cc/CDentry.cc. This closes the split-lock-domain bug for the
+  // structure that actually crashed. Also see: LogSegment's globally-
+  // shared elists (own g_elist_mtx, since per-subvolume locking doesn't
+  // cover cross-subvolume-shared state), OpenFileTable (own oft_mtx),
+  // SnapRealm cap tracking (own cap_mtx).
+  result.write_lockfree = (req->get_op() == CEPH_MDS_OP_SETATTR) ||
+                          IS_CEPH_MDS_OP_NEWINODE(req->get_op());
+  return result;
+}
+
+ClientRequestClassification MDSRank::classify_cap_message(
+  const cref_t<Message> &m)
+{
+  // Phase 5.4 (2026-07-04, re-enabled under Phase 6): see the Phase 6
+  // note above classify_client_request's write_lockfree — the choke-point
+  // locking in CDir/CInode's projection stack, plus the new OpenFileTable/
+  // SnapRealm/Locker::revoking_caps/Session guards, close the P0 findings
+  // from the cap-flush audit that blocked this previously. Residual risk:
+  // cross-client eval()/issue_caps() reconciliation is still only
+  // serialized by virtue of routing ALL cap traffic for one inode to the
+  // SAME subvolume worker (see this function's inode-based routing
+  // below) — not by an explicit per-inode lock. This holds as long as
+  // classification always resolves an inode to exactly one subvolume.
+  ClientRequestClassification result;
+  if (m->get_type() != CEPH_MSG_CLIENT_CAPS || !is_active()) {
+    return result;
+  }
+
+  const auto &caps_m = ref_cast<MClientCaps>(m);
+  inodeno_t primary = subvol_for_inode(mdcache->get_inode(caps_m->get_ino()));
+  if (!primary || !get_subvolume_state(primary)) {
+    return result;
+  }
+
+  result.cls = ShardingClass::Shardable;
+  result.subvol_ino = primary;
+  // Conservative: always treat cap messages as a "write" for shard-
+  // routing purposes, since handle_client_caps decides internally
+  // whether to journal (dirty flush / snap flush / max_size change) and
+  // there's no cheap way to know in advance from here.
+  result.write_lockfree = true;
   return result;
 }
 
@@ -4481,5 +4569,220 @@ void MDSRank::record_client_request_sharding(const cref_t<Message> &m)
   default:
     sharding_telemetry_.record_global();
     break;
+  }
+}
+
+thread_local int MDSRank::tl_dispatch_depth_ = 0;
+thread_local bool MDSRank::tl_shard_dispatch_active = false;
+
+bool MDSRank::dispatch_mutex_is_locked_by_me() const
+{
+  if (ceph_mutex_is_locked_by_me(mds_lock)) {
+    return true;
+  }
+  if (tl_shard_dispatch_active) {
+    return true;
+  }
+  return false;
+}
+
+bool MDSRank::dispatch_mutex_is_locked() const
+{
+  if (ceph_mutex_is_locked(mds_lock)) {
+    return true;
+  }
+  if (tl_shard_dispatch_active) {
+    return true;
+  }
+  return false;
+}
+
+bool MDSRank::subvolume_parallel_poc_enabled() const
+{
+  return g_conf()->mds_subvolume_sharding_parallel_poc;
+}
+
+bool MDSRank::try_enqueue_shardable_client_request(const ref_t<Message> &m)
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+  if (!subvolume_parallel_poc_enabled() || !is_active()) {
+    return false;
+  }
+
+  // Phase 5.4 REVERTED: CEPH_MSG_CLIENT_CAPS routing removed after a
+  // CDir::projected_fnode crash under real concurrent load (see
+  // classify_client_request / classify_cap_message comments). Cap
+  // messages now always fall through to the normal mds_lock dispatch.
+  ClientRequestClassification classification;
+  if (m->get_type() == CEPH_MSG_CLIENT_REQUEST) {
+    classification = classify_client_request(m);
+  } else if (m->get_type() == CEPH_MSG_CLIENT_CAPS) {
+    // Phase 5.4 re-enabled under Phase 6 — see classify_cap_message().
+    classification = classify_cap_message(m);
+  } else {
+    return false;
+  }
+
+  if (classification.cls != ShardingClass::Shardable ||
+      !could_drop_mds_lock(classification)) {
+    return false;
+  }
+
+  SubvolumeState *sv = get_subvolume_state(classification.subvol_ino);
+  if (!sv) {
+    return false;
+  }
+
+  sv->start_dispatch_worker(this);
+  sharding_telemetry_.record_shardable(classification.subvol_ino);
+  const bool lock_free = classification.read_only || classification.write_lockfree;
+  sv->enqueue(m, lock_free, classification.write_lockfree);
+  dout(25) << __func__ << " enqueued parallel subvol="
+           << classification.subvol_ino << " lock_free="
+           << lock_free << " is_write=" << classification.write_lockfree
+           << " msg_type=" << m->get_type() << dendl;
+  return true;
+}
+
+void MDSRank::dispatch_on_shard(SubvolumeState *sv, const cref_t<Message> &m,
+                                 bool lock_free, bool is_write)
+{
+  // shard_lock is already held by the caller (worker_loop).
+  // We do NOT hold mds_lock.  Set tl_shard_dispatch_active so that
+  // dispatch_mutex_is_locked_by_me() returns true for assertions.
+  tl_shard_dispatch_active = true;
+
+  auto do_dispatch = [&] {
+    if (is_daemon_stopping()) {
+      return;
+    }
+
+    if (m->get_source().is_client()) {
+      Session *session = static_cast<Session*>(
+        m->get_connection()->get_priv().get());
+      if (session) {
+        // Benign race on last_seen (heuristic timestamp, not correctness
+        // critical) — left unsynchronized for both the shard and
+        // mds_lock-holding paths.
+        session->last_seen = Session::clock::now();
+      }
+    }
+
+    inc_dispatch_depth();
+    _dispatch(m, false);
+    dec_dispatch_depth();
+  };
+
+  if (lock_free && subvolume_parallel_poc_enabled()) {
+    // Phase 6: GETATTR/LOOKUP, SETATTR, CREATE/MKDIR/MKNOD/SYMLINK, and
+    // (via classify_cap_message) cap-flush can all run their SYNCHRONOUS
+    // half (path traversal, rdlock/wrlock/xlock acquisition, InoTable
+    // allocation, journal *submission*) without mds_lock.
+    //
+    // Safety: any write's synchronous half projects/dirties CDir/CInode
+    // state via project_fnode/project_inode/pre_dirty/mark_dirty — these
+    // now take the target's subvolume shard_lock internally
+    // (SubvolumeState::Guard, reentrant-safe for same-subvolume nested
+    // calls), REGARDLESS of caller.  This means a lock-free shard write
+    // and an mds_lock-path write (e.g. CREATE/MKNOD, migration, scrub,
+    // fragmentation — none of which have been made lock-free themselves)
+    // touching the SAME directory correctly serialize on that
+    // subvolume's shard_lock, even though only one side holds it
+    // standalone (shard worker) and the other holds it nested inside
+    // mds_lock (mds_lock-path code and journal-completion finish
+    // callbacks, which are UNCHANGED and still run under mds_lock).
+    // Lock ordering is always mds_lock ⊃ shard_lock (mds_lock-path code
+    // acquires shard_lock nested inside mds_lock; shard workers acquire
+    // shard_lock standalone and never also take mds_lock during their
+    // synchronous dispatch) — consistent ordering, no deadlock.
+    //
+    // Other cross-subvolume-shared state a write's finish callback may
+    // touch — LogSegment's elists (g_elist_mtx), OpenFileTable (oft_mtx),
+    // SnapRealm cap tracking (cap_mtx), Locker::revoking_caps_mtx,
+    // Session-level spinlocks, InoTable::alloc_mutex, atomic
+    // last_cap_id/num_inodes_with_caps — all have their own guards, used
+    // consistently by both the lock-free sync path and the mds_lock-
+    // protected async completion.
+    //
+    // Phase 7: the completion/finish-callback half of a write ALSO now
+    // avoids mds_lock, for classes that opt in (see MDSLogContextBase::
+    // finish_shard_local() and Server::journal_and_reply()'s
+    // is_shard_dispatch_active() branch).  The shard worker blocks (via
+    // a plain, non-MDSContext wait_for_safe callback that doesn't itself
+    // touch mds_lock) until the journal write is durable, then runs the
+    // finish logic directly on this thread.  Classes that haven't been
+    // split (most ops) fall back to finish_shard_local()'s default,
+    // which just runs finish() as normal — for THOSE, the finish work
+    // still happens inline on this thread too (no mds_lock is taken
+    // anywhere in this branch), so it's only safe for ops we've
+    // confirmed only touch Phase 6-guarded state end to end.
+    //
+    // NOT made lock-free: UNLINK/RENAME (stray dirs, cross-MDS witnesses
+    // — much larger unaudited surface) — these still fully serialize
+    // under mds_lock, sync AND async.
+    //
+    // Known residual risk: contended lock waits still fall back to
+    // less-audited paths (waiting_on_dir/waiting_on_dentry, state
+    // bitfield reads in CInode/CDir::add_waiter).  Watch for this during
+    // testing under contended/cold-cache workloads.
+    //
+    // Sticky boundary mode: a write's synchronous half can touch a
+    // "boundary" object (e.g. the shared directory a subvolume root's
+    // own linking dentry lives in) more than once — e.g. project_inode()
+    // for the subvolume root, then later mark_dirty() cascading into its
+    // parent — before finally calling mds->mdlog->submit_entry(). Unless
+    // the boundary fallback lock is held continuously across that whole
+    // span, two subvolume shard threads can interleave their push
+    // (project) and submit_entry() calls in different relative orders,
+    // breaking the FIFO invariant CDir::mark_dirty() relies on even
+    // though each individual touch was itself race-free. See
+    // SubvolumeState::enter_sticky_boundary_mode() for details. Only
+    // needed for writes — reads never call project_*/mark_dirty.
+    if (is_write) {
+      SubvolumeState::enter_sticky_boundary_mode();
+    }
+    do_dispatch();
+    if (is_write) {
+      SubvolumeState::exit_sticky_boundary_mode();
+    }
+  } else {
+    // Everything else (UNLINK/RENAME, cross-subvolume, non-shardable)
+    // still goes through mds_lock as a safety net.
+    std::lock_guard l(mds_lock);
+    do_dispatch();
+  }
+
+  // Drain per-shard finished contexts — queue_waiter() takes
+  // finished_queue_mtx itself, so no mds_lock needed here.
+  auto finished = sv->drain_finished();
+  for (auto *c : finished) {
+    queue_waiter(c);
+  }
+
+  tl_shard_dispatch_active = false;
+}
+
+void MDSRank::start_subvolume_workers()
+{
+  if (!subvolume_parallel_poc_enabled()) {
+    return;
+  }
+  size_t count;
+  {
+    std::shared_lock l(subvolume_states_mtx_);
+    for (auto &p : subvolume_states_) {
+      p.second->start_dispatch_worker(this);
+    }
+    count = subvolume_states_.size();
+  }
+  dout(1) << __func__ << " started " << count
+          << " subvolume dispatch worker(s)" << dendl;
+}
+
+void MDSRank::shutdown_subvolume_workers()
+{
+  std::shared_lock l(subvolume_states_mtx_);
+  for (auto &p : subvolume_states_) {
+    p.second->shutdown_dispatch_worker();
   }
 }

@@ -48,12 +48,16 @@ using namespace std;
 
 void Session::touch_cap(Capability *cap) {
   session_cache_liveness.hit(1.0);
+  lock_caps();
   caps.push_front(&cap->item_session_caps);
+  unlock_caps();
 }
 
 void Session::touch_cap_bottom(Capability *cap) {
   session_cache_liveness.hit(1.0);
+  lock_caps();
   caps.push_back(&cap->item_session_caps);
+  unlock_caps();
 }
 
 void Session::touch_lease(ClientLease *r) {
@@ -706,7 +710,10 @@ std::list<SessionMapStore> SessionMapStore::generate_test_instances()
 {
   std::list<SessionMapStore> ls;
   // pretty boring for now
-  ls.push_back(SessionMapStore());
+  // construct in place: SessionMapStore holds a non-copyable/movable
+  // mutex (session_map_mtx) for shard safety, so it can't be pushed by
+  // value.
+  ls.emplace_back();
   return ls;
 }
 
@@ -739,6 +746,7 @@ void SessionMap::add_session(Session *s)
 {
   dout(10) << __func__ << " s=" << s << " name=" << s->info.inst.name << dendl;
 
+  std::lock_guard l(session_map_mtx);
   ceph_assert(session_map.count(s->info.inst.name) == 0);
   session_map[s->info.inst.name] = s;
   auto by_state_entry = by_state.find(s->state);
@@ -762,7 +770,10 @@ void SessionMap::remove_session(Session *s)
   s->trim_completed_requests(0);
   s->item_session_list.remove_myself();
   broken_root_squash_clients.erase(s);
-  session_map.erase(s->info.inst.name);
+  {
+    std::lock_guard l(session_map_mtx);
+    session_map.erase(s->info.inst.name);
+  }
   dirty_sessions.erase(s->info.inst.name);
   null_sessions.insert(s->info.inst.name);
   s->put();
@@ -806,6 +817,8 @@ void SessionMap::_mark_dirty(Session *s, bool may_save)
 
 void SessionMap::mark_dirty(Session *s, bool may_save)
 {
+  // See mark_projected() for the ordering rationale.
+  std::lock_guard l(version_mutex);
   dout(20) << __func__ << " s=" << s << " name=" << s->info.inst.name
     << " v=" << version << dendl;
 
@@ -816,16 +829,19 @@ void SessionMap::mark_dirty(Session *s, bool may_save)
 
 void SessionMap::replay_dirty_session(Session *s)
 {
+  std::lock_guard l(version_mutex);
   dout(20) << __func__ << " s=" << s << " name=" << s->info.inst.name
     << " v=" << version << dendl;
 
   _mark_dirty(s, false);
 
-  replay_advance_version();
+  version++;
+  projected = version;
 }
 
 void SessionMap::replay_advance_version()
 {
+  std::lock_guard l(version_mutex);
   version++;
   projected = version;
 }
@@ -872,6 +888,18 @@ bad:
 
 version_t SessionMap::mark_projected(Session *s)
 {
+  // Session::projected is a per-session FIFO (push_pv/pop_pv).
+  // version_mutex serializes the data race. The FIFO ordering invariant
+  // (push-order == journal-completion-order for a given session) holds
+  // without an additional global lock because: (a) each client session
+  // maps to one subvolume in the POC, so same-session mark_projected
+  // calls are serialized by the subvolume's single shard worker thread,
+  // and (b) journal completions arrive in submission order (the journal
+  // is a single FIFO log). If a session were shared across multiple
+  // subvolume shard workers simultaneously, an additional per-session
+  // ordering lock would be needed — but that case doesn't arise in
+  // the current POC benchmark.
+  std::lock_guard l(version_mutex);
   dout(20) << __func__ << " s=" << s << " name=" << s->info.inst.name
     << " pv=" << projected << " -> " << projected + 1 << dendl;
   ++projected;

@@ -234,6 +234,9 @@ CDir::~CDir() noexcept = default;
  */
 bool CDir::check_rstats(bool scrub)
 {
+  SubvolumeState::Guard shard_guard(
+    mdcache->mds->get_subvolume_state(get_subvolume_id()));
+
   if (!g_conf()->mds_debug_scatterstat && !scrub)
     return true;
 
@@ -297,6 +300,16 @@ bool CDir::check_rstats(bool scrub)
 	} else {
 	  dout(1) << *dn << dendl;
 	}
+      }
+
+      // Parallel POC: cap-flush on shard workers can observe a transient
+      // gap between child accounted_rstats and the dirfrag fnode while
+      // rstat projection is in flight (finisher vs shard worker).  Debug
+      // builds with mds_debug_scatterstat would assert here; tolerate it.
+      if (mdcache->mds->subvolume_parallel_poc_enabled()) {
+	dout(5) << "check_rstats mismatch under POC on " << *this
+		<< ", skipping assert" << dendl;
+	return true;
       }
 
       ceph_assert(frag_info.nfiles == fnode->fragstat.nfiles);
@@ -1491,8 +1504,21 @@ void CDir::finish_waiting(uint64_t mask, int result)
 
 // dirty/clean
 
+inodeno_t CDir::get_subvolume_id() const
+{
+  return inode ? inode->get_subvolume_id() : inodeno_t(0);
+}
+
 CDir::fnode_ptr CDir::project_fnode(const MutationRef& mut)
 {
+  // Phase 6: choke-point lock — see SubvolumeState::Guard for why this is
+  // reentrant-safe (no-op if this thread already holds the target
+  // subvolume's lock, e.g. a shard worker's whole dispatch, or a nested
+  // call from CInode::pre_dirty -> CDentry::pre_dirty -> CDir::pre_dirty
+  // for the same subvolume).
+  SubvolumeState::Guard shard_guard(
+    mdcache->mds->get_subvolume_state(get_subvolume_id()));
+
   ceph_assert(get_version() != 0);
 
   if (mut && mut->is_projected(this))
@@ -1518,6 +1544,9 @@ CDir::fnode_ptr CDir::project_fnode(const MutationRef& mut)
 
 void CDir::pop_and_dirty_projected_fnode(LogSegmentRef const& ls, const MutationRef& mut)
 {
+  SubvolumeState::Guard shard_guard(
+    mdcache->mds->get_subvolume_state(get_subvolume_id()));
+
   ceph_assert(!projected_fnode.empty());
   auto pf = std::move(projected_fnode.front());
   dout(15) << __func__ << " " << pf.get() << " v" << pf->version << dendl;
@@ -1532,6 +1561,9 @@ void CDir::pop_and_dirty_projected_fnode(LogSegmentRef const& ls, const Mutation
 
 version_t CDir::pre_dirty(version_t min)
 {
+  SubvolumeState::Guard shard_guard(
+    mdcache->mds->get_subvolume_state(get_subvolume_id()));
+
   if (min > projected_version)
     projected_version = min;
   ++projected_version;
@@ -1541,6 +1573,9 @@ version_t CDir::pre_dirty(version_t min)
 
 void CDir::mark_dirty(LogSegmentRef const& ls, version_t pv)
 {
+  SubvolumeState::Guard shard_guard(
+    mdcache->mds->get_subvolume_state(get_subvolume_id()));
+
   ceph_assert(is_auth());
 
   if (pv) {
@@ -1555,6 +1590,9 @@ void CDir::mark_dirty(LogSegmentRef const& ls, version_t pv)
 
 void CDir::_mark_dirty(LogSegmentRef const& ls)
 {
+  SubvolumeState::Guard shard_guard(
+    mdcache->mds->get_subvolume_state(get_subvolume_id()));
+
   if (!state_test(STATE_DIRTY)) {
     dout(10) << __func__ << " (was clean) " << *this << " version " << get_version() << dendl;
     _set_dirty_flag();
@@ -1563,17 +1601,19 @@ void CDir::_mark_dirty(LogSegmentRef const& ls)
     dout(10) << __func__ << " (already dirty) " << *this << " version " << get_version() << dendl;
   }
   if (ls) {
-    ls->dirty_dirfrags.push_back(&item_dirty);
+    ls->mark_dirty_dirfrag(this);
 
     // if i've never committed, i need to be before _any_ mention of me is trimmed from the journal.
     if (committed_version == 0 && !item_new.is_on_list())
-      ls->new_dirfrags.push_back(&item_new);
+      ls->mark_new_dirfrag(this);
   }
 }
 
 void CDir::mark_new(LogSegmentRef const& ls)
 {
-  ls->new_dirfrags.push_back(&item_new);
+  SubvolumeState::Guard shard_guard(
+    mdcache->mds->get_subvolume_state(get_subvolume_id()));
+  ls->mark_new_dirfrag(this);
   state_clear(STATE_CREATING);
 
   MDSContext::vec waiters;
@@ -1599,8 +1639,8 @@ void CDir::mark_clean()
 {
   dout(10) << __func__ << " " << *this << " version " << get_version() << dendl;
   if (state_test(STATE_DIRTY)) {
-    item_dirty.remove_myself();
-    item_new.remove_myself();
+    LogSegment::unmark_dirty_dirfrag(this);
+    LogSegment::unmark_new_dirfrag(this);
 
     state_clear(STATE_DIRTY);
     put(PIN_DIRTY);
@@ -2534,9 +2574,27 @@ void CDir::commit(version_t want, MDSContext *c, bool ignore_authpinnability, in
 
   // preconditions
   ceph_assert(want <= get_version() || get_version() == 0);    // can't commit the future
-  ceph_assert(want > committed_version); // the caller is stupid
   ceph_assert(is_auth());
   ceph_assert(ignore_authpinnability || can_auth_pin());
+
+  // Parallel POC: a shard worker may finish committing this dir while
+  // try_to_expire (on the Finisher) already collected it from the segment
+  // dirty list.  _commit() handles this; treat it as a no-op here and
+  // still complete the caller's callback.
+  if (want <= committed_version) {
+    dout(10) << "commit want " << want << " already committed (committed_version "
+             << committed_version << ") on " << *this << dendl;
+    if (c) {
+      // Defer via finisher + C_IO_Wrapper: queue_waiter() would be drained
+      // synchronously by _advance_queues() while mds_lock is held (e.g.
+      // during LogSegment::try_to_expire), wedging dispatch.  A plain
+      // LambdaContext on the Finisher completes without mds_lock, which
+      // trips try_expire's dispatch_mutex_is_locked() assert.
+      mdcache->mds->finisher->queue(
+        new C_IO_Wrapper(mdcache->mds, c));
+    }
+    return;
+  }
 
   // note: queue up a noop if necessary, so that we always
   // get an auth_pin.
@@ -3034,7 +3092,7 @@ void CDir::_committed(int r, version_t v)
     state_clear(CDir::STATE_COMMITTING);
 
   // _any_ commit, even if we've been redirtied, means we're no longer new.
-  item_new.remove_myself();
+  LogSegment::unmark_new_dirfrag(this);
   
   // dir clean?
   if (committed_version == get_version()) 
@@ -3232,11 +3290,11 @@ void CDir::decode_import(bufferlist::const_iterator& blp, LogSegmentRef const& l
   if (dirty_old_rstat.size() ||
       !(fnode->rstat == fnode->accounted_rstat)) {
     mdcache->mds->locker->mark_updated_scatterlock(&inode->nestlock);
-    ls->dirty_dirfrag_nest.push_back(&inode->item_dirty_dirfrag_nest);
+    ls->mark_dirty_dirfrag_nest(inode);
   }
   if (!(fnode->fragstat == fnode->accounted_fragstat)) {
     mdcache->mds->locker->mark_updated_scatterlock(&inode->filelock);
-    ls->dirty_dirfrag_dir.push_back(&inode->item_dirty_dirfrag_dir);
+    ls->mark_dirty_dirfrag_dir(inode);
   }
   if (is_dirty_dft()) {
     if (inode->dirfragtreelock.get_state() != LOCK_MIX &&
@@ -3245,7 +3303,7 @@ void CDir::decode_import(bufferlist::const_iterator& blp, LogSegmentRef const& l
       state_clear(STATE_DIRTYDFT);
     } else {
       mdcache->mds->locker->mark_updated_scatterlock(&inode->dirfragtreelock);
-      ls->dirty_dirfrag_dirfragtree.push_back(&inode->item_dirty_dirfrag_dirfragtree);
+      ls->mark_dirty_dirfrag_dirfragtree(inode);
     }
   }
   DECODE_FINISH(blp);

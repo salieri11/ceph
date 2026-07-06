@@ -16,6 +16,7 @@
 #include "Capability.h"
 #include "BatchOp.h"
 #include "CInode.h"
+#include "Locker.h" // for Locker::revoking_caps_mtx
 #include "Mutation.h" // for struct MDLockCache
 #include "SessionMap.h"
 
@@ -189,7 +190,52 @@ client_t Capability::get_client() const
   return session ? session->get_client() : client_t(-1);
 }
 
+ceph_seq_t Capability::issue(unsigned c, bool reval)
+{
+  std::lock_guard l(state_mtx_);
+  if (reval)
+    revalidate();
+
+  if (_pending & ~c) {
+    // revoking (and maybe adding) bits.  note caps prior to this revocation
+    _revokes.emplace_back(_pending, last_sent, last_issue);
+    _pending = c;
+    _issued |= c;
+    if (!is_notable())
+      mark_notable();
+  } else if (~_pending & c) {
+    // adding bits only.  remove obsolete revocations?
+    _pending |= c;
+    _issued |= c;
+    // drop old _revokes with no bits we don't have
+    while (!_revokes.empty() &&
+	   (_revokes.back().before & ~_pending) == 0)
+      _revokes.pop_back();
+  } else {
+    // no change.
+    ceph_assert(_pending == c);
+  }
+  //last_issue = 
+  inc_last_seq();
+  return last_sent;
+}
+
+ceph_seq_t Capability::issue_norevoke(unsigned c, bool reval)
+{
+  std::lock_guard l(state_mtx_);
+  if (reval)
+    revalidate();
+
+  _pending |= c;
+  _issued |= c;
+  clear_new();
+
+  inc_last_seq();
+  return last_sent;
+}
+
 int Capability::confirm_receipt(ceph_seq_t seq, unsigned caps) {
+  std::lock_guard l(state_mtx_);
   int was_revoking = (_issued & ~_pending);
   if (seq == last_sent) {
     _revokes.clear();
@@ -222,11 +268,41 @@ int Capability::confirm_receipt(ceph_seq_t seq, unsigned caps) {
   }
 
   if (was_revoking && _issued == _pending) {
-    item_revoking_caps.remove_myself();
-    item_client_revoking_caps.remove_myself();
+    {
+      // Guard against Locker::issue_caps()'s push_back() onto these SAME
+      // elist items running concurrently on another (possibly lock-free
+      // shard worker) thread — confirm_receipt() itself can run
+      // lock-free on a shard worker for cap-flush handling.
+      std::lock_guard rl(Locker::revoking_caps_mtx);
+      item_revoking_caps.remove_myself();
+      item_client_revoking_caps.remove_myself();
+    }
     maybe_clear_notable();
   }
   return was_revoking & ~_issued; // return revoked
+}
+
+void Capability::clean_revoke_from(ceph_seq_t li)
+{
+  std::lock_guard l(state_mtx_);
+  bool changed = false;
+  while (!_revokes.empty() && _revokes.front().last_issue <= li) {
+    _revokes.pop_front();
+    changed = true;
+  }
+  if (changed) {
+    bool was_revoking = (_issued & ~_pending);
+    calc_issued();
+    if (was_revoking && _issued == _pending) {
+      {
+        // See confirm_receipt() above for why this needs the lock.
+        std::lock_guard rl(Locker::revoking_caps_mtx);
+        item_revoking_caps.remove_myself();
+        item_client_revoking_caps.remove_myself();
+      }
+      maybe_clear_notable();
+    }
+  }
 }
 
 bool Capability::is_stale() const
@@ -263,6 +339,7 @@ void Capability::maybe_clear_notable()
 }
 
 void Capability::set_wanted(int w) {
+  std::lock_guard l(state_mtx_);
   CInode *in = get_inode();
   if (in) {
     if (!is_wanted_notable(_wanted) && is_wanted_notable(w)) {

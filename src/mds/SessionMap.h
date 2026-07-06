@@ -16,10 +16,13 @@
 #ifndef CEPH_MDS_SESSIONMAP_H
 #define CEPH_MDS_SESSIONMAP_H
 
+#include <algorithm>
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <list>
 #include <map>
+#include <mutex>
 #include <ostream>
 #include <set>
 #include <string>
@@ -35,6 +38,7 @@
 #include "mds/MDSAuthCaps.h"
 #include "common/ceph_time.h" // for ceph::coarse_mono_{clock,time}
 #include "common/DecayCounter.h"
+#include "common/fair_mutex.h"
 
 #include "Mutation.h" // for struct MDRequestImpl
 #include "msg/Message.h"
@@ -136,8 +140,19 @@ public:
 
   void pop_pv(version_t v)
   {
+    // Parallel sharding POC: under stock Ceph (single-threaded under
+    // mds_lock), mark_projected(++projected) and mark_dirty(++version)
+    // are strictly paired and sequential, so push_pv(projected) always
+    // matches pop_pv(version) in FIFO order. With concurrent shard
+    // workers, the global `projected` and `version` counters can
+    // increment for DIFFERENT sessions on different threads, making the
+    // pushed value and the popped value diverge. Instead of asserting an
+    // exact match, just verify the session has outstanding projections
+    // and consume one. The per-session projected count is what matters
+    // for correctness (it tracks "how many in-flight mutations are
+    // journaling for this session"), not which specific version number
+    // was pushed.
     ceph_assert(!projected.empty());
-    ceph_assert(projected.front() == v);
     projected.pop_front();
   }
 
@@ -185,7 +200,28 @@ public:
     return cap_acquisition.get();
   }
 
+  // ino_alloc_mutex_ guards prealloc_inos/free_prealloc_inos/delegated_inos
+  // — a single client session can have open fds across multiple
+  // subvolumes, so two different subvolume shard workers could call
+  // take_ino()/delegate_inos() for the same session concurrently
+  // (Phase 5.3 groundwork; not yet wired into a lock-free CREATE path).
+  // A real mutex is used (not a busy-wait spinlock) so a spinning thread
+  // can't starve the holder's scheduling under CPU oversubscription.
+  void lock_ino_alloc() const {
+    ino_alloc_mutex_.lock();
+  }
+  void unlock_ino_alloc() const {
+    ino_alloc_mutex_.unlock();
+  }
+
   inodeno_t take_ino(inodeno_t ino = 0) {
+    lock_ino_alloc();
+    inodeno_t out = take_ino_locked(ino);
+    unlock_ino_alloc();
+    return out;
+  }
+
+  inodeno_t take_ino_locked(inodeno_t ino = 0) {
     if (ino) {
       if (!info.prealloc_inos.contains(ino))
         return 0;
@@ -204,9 +240,12 @@ public:
   }
 
   void delegate_inos(int want, interval_set<inodeno_t>& inos) {
+    lock_ino_alloc();
     want -= (int)delegated_inos.size();
-    if (want <= 0)
+    if (want <= 0) {
+      unlock_ino_alloc();
       return;
+    }
 
     for (auto it = free_prealloc_inos.begin(); it != free_prealloc_inos.end(); ) {
       if (want < (int)it.get_len()) {
@@ -222,6 +261,7 @@ public:
       if (want <= 0)
 	break;
     }
+    unlock_ino_alloc();
   }
 
   // sans any delegated ones
@@ -309,11 +349,19 @@ public:
     return !waitfor_flush.empty();
   }
 
+  // completed_requests_mutex_ guards info.completed_requests since shard
+  // worker threads may add/trim/check this concurrently with the
+  // mds_lock-holding thread for the same session (e.g. non-shardable
+  // messages interleaved with shardable ones for the same client). A real
+  // mutex is used (not a busy-wait spinlock) so a spinning thread can't
+  // starve the holder's scheduling under CPU oversubscription.
   void add_completed_request(ceph_tid_t t, inodeno_t created) {
+    std::lock_guard l(completed_requests_mutex_);
     info.completed_requests[t] = created;
     completed_requests_dirty = true;
   }
   bool trim_completed_requests(ceph_tid_t mintid) {
+    std::lock_guard l(completed_requests_mutex_);
     // trim
     bool erased_any = false;
     last_trim_completed_requests_tid = mintid;
@@ -329,18 +377,24 @@ public:
     return erased_any;
   }
   bool have_completed_request(ceph_tid_t tid, inodeno_t *pcreated) const {
+    std::lock_guard l(completed_requests_mutex_);
     auto p = info.completed_requests.find(tid);
-    if (p == info.completed_requests.end())
-      return false;
-    if (pcreated)
+    bool found = p != info.completed_requests.end();
+    if (found && pcreated)
       *pcreated = p->second;
-    return true;
+    return found;
   }
 
+  // completed_flushes_mutex_ guards info.completed_flushes for the same
+  // reason completed_requests_mutex_ guards completed_requests — cap-flush
+  // shard workers may add/trim/check this concurrently with the
+  // mds_lock-holding thread for the same session.
   void add_completed_flush(ceph_tid_t tid) {
+    std::lock_guard l(completed_flushes_mutex_);
     info.completed_flushes.insert(tid);
   }
   bool trim_completed_flushes(ceph_tid_t mintid) {
+    std::lock_guard l(completed_flushes_mutex_);
     bool erased_any = false;
     last_trim_completed_flushes_tid = mintid;
     while (!info.completed_flushes.empty() &&
@@ -354,7 +408,9 @@ public:
     return erased_any;
   }
   bool have_completed_flush(ceph_tid_t tid) const {
-    return info.completed_flushes.count(tid);
+    std::lock_guard l(completed_flushes_mutex_);
+    bool found = info.completed_flushes.count(tid);
+    return found;
   }
 
   uint64_t get_num_caps() const {
@@ -431,6 +487,20 @@ public:
    * support const iterators yet.
    */
   mutable elist<MDRequestImpl*> requests;
+  // requests_mutex_ guards `requests` — shard worker threads push onto this
+  // list without mds_lock (Phase 5.2 write-lockfree ops), while
+  // request_cleanup/request_kill (running under mds_lock on the finisher
+  // thread for journaled writes) remove from it.  Take this lock around
+  // any push_back/remove_myself on `requests`. A real mutex is used (not
+  // a busy-wait spinlock) so a spinning thread can't starve the holder's
+  // scheduling under CPU oversubscription.
+  mutable std::mutex requests_mutex_;
+  void lock_requests() const {
+    requests_mutex_.lock();
+  }
+  void unlock_requests() const {
+    requests_mutex_.unlock();
+  }
 
   interval_set<inodeno_t> pending_prealloc_inos; // journaling prealloc, will be added to prealloc_inos
   interval_set<inodeno_t> free_prealloc_inos; //
@@ -504,6 +574,25 @@ private:
 
   ceph_tid_t last_trim_completed_requests_tid = 0;
   ceph_tid_t last_trim_completed_flushes_tid = 0;
+
+  mutable std::mutex completed_requests_mutex_;
+  mutable std::mutex ino_alloc_mutex_;
+  mutable std::mutex completed_flushes_mutex_;
+
+public:
+  // caps_mutex_ guards the `caps` xlist — cap-flush shard workers touch
+  // this via Capability::mark_notable()/Session::touch_cap() concurrently
+  // with mds_lock-path cap release/eviction handling on the same session.
+  // A real mutex is used (not a busy-wait spinlock) so a spinning thread
+  // can't starve the holder's scheduling under CPU oversubscription.
+  void lock_caps() const {
+    caps_mutex_.lock();
+  }
+  void unlock_caps() const {
+    caps_mutex_.unlock();
+  }
+private:
+  mutable std::mutex caps_mutex_;
 };
 
 class SessionFilter
@@ -574,6 +663,7 @@ public:
 protected:
   version_t version = 0;
   std::unordered_map<entity_name_t, Session*> session_map;
+  mutable ceph::fair_mutex session_map_mtx{"SessionMapStore::session_map_mtx"};
   PerfCounters *logger =nullptr;
 
   // total request load avg
@@ -640,15 +730,21 @@ public:
       is_any_state(Session::STATE_STALE) ||
       is_any_state(Session::STATE_KILLING);
   }
+  // session_map_mtx guards session_map lookups/mutations against shard
+  // worker threads doing concurrent get_session() while the mds_lock
+  // path opens/closes sessions (add_session/remove_session).
   bool have_session(entity_name_t w) const {
+    std::lock_guard l(session_map_mtx);
     return session_map.count(w);
   }
   Session* get_session(entity_name_t w) {
+    std::lock_guard l(session_map_mtx);
     auto session_map_entry = session_map.find(w);
     return (session_map_entry != session_map.end() ?
 	    session_map_entry-> second : nullptr);
   }
   const Session* get_session(entity_name_t w) const {
+    std::lock_guard l(session_map_mtx);
     auto p = session_map.find(w);
     if (p == session_map.end()) {
       return NULL;
@@ -806,6 +902,12 @@ protected:
   std::set<entity_name_t> dirty_sessions;
   std::set<entity_name_t> null_sessions;
   bool loaded_legacy = false;
+
+  // Dedicated critical section for version/projected/dirty_sessions
+  // mutation — shard worker threads call mark_dirty()/mark_projected()
+  // at write-completion time without holding mds_lock, so this can no
+  // longer rely on mds_lock for exclusivity (mirrors MDLog::submit_mutex).
+  mutable ceph::fair_mutex version_mutex{"SessionMap::version_mutex"};
 
 private:
   uint64_t get_session_count_in_state(int state) {

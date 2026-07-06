@@ -17,6 +17,8 @@
 #ifndef CEPH_INOTABLE_H
 #define CEPH_INOTABLE_H
 
+#include <mutex>
+
 #include "MDSTable.h"
 #include "include/fs_types.h" // for inodeno_t
 #include "include/interval_set.h"
@@ -27,6 +29,20 @@ class InoTable : public MDSTable {
  public:
   explicit InoTable(MDSRank *m) : MDSTable(m, "inotable", true) {}
   InoTable() : MDSTable(NULL, "inotable", true) {}
+
+  // alloc_mutex is per-instance and intentionally not copied — copies get
+  // their own fresh (default-constructed) mutex.  Needed because
+  // ceph-dencoder and generate_test_instances() copy InoTable instances.
+  InoTable(const InoTable& other)
+    : MDSTable(other), free(other.free), projected_free(other.projected_free) {}
+  InoTable& operator=(const InoTable& other) {
+    if (this != &other) {
+      MDSTable::operator=(other);
+      free = other.free;
+      projected_free = other.projected_free;
+    }
+    return *this;
+  }
 
   inodeno_t project_alloc_id(inodeno_t id=0);
   void apply_alloc_id(inodeno_t id);
@@ -100,6 +116,12 @@ class InoTable : public MDSTable {
  private:
   interval_set<inodeno_t> free;   // unused ids
   interval_set<inodeno_t> projected_free;
+
+  // Dedicated critical section for the alloc/release hot path (project_*/
+  // apply_*) so CREATE/MKDIR from different subvolume shard workers don't
+  // race on `free`/`projected_free`/version counters.  Replay/repair/dump
+  // paths are left unguarded — they only run outside of active dispatch.
+  mutable std::mutex alloc_mutex;
 };
 WRITE_CLASS_ENCODER(InoTable)
 

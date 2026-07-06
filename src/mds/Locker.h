@@ -17,6 +17,7 @@
 #define CEPH_MDS_LOCKER_H
 
 #include <map>
+#include <mutex>
 #include <memory>
 #include <set>
 #include <string_view>
@@ -58,6 +59,15 @@ using mempool_xattr_map = xattr_map<mempool::mds_co::pool_allocator>; // FIXME b
 class Locker {
 public:
   Locker(MDSRank *m, MDCache *c);
+
+  // Guards revoking_caps / revoking_caps_by_client — cap-flush shard
+  // workers (issue_caps) push onto these without mds_lock, while
+  // caps_tick() and CInode::remove_client_cap() (mds_lock path) also
+  // mutate/iterate them.  Public + static since CInode::remove_client_cap
+  // needs to take it without a Locker instance handy, and there is one
+  // Locker instance per MDS rank/process, so a static mutex here is
+  // equivalent in scope to a per-instance one.
+  static inline std::mutex revoking_caps_mtx;
 
   SimpleLock *get_lock(int lock_type, const MDSCacheObjectInfo &info);
   

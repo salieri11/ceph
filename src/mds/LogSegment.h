@@ -16,6 +16,8 @@
 #ifndef CEPH_LOGSEGMENT_H
 #define CEPH_LOGSEGMENT_H
 
+#include <mutex>
+
 #include "include/elist.h"
 #include "include/interval_set.h"
 #include "include/Context.h"
@@ -71,6 +73,119 @@ class LogSegment {
   {
     ceph_assert(c != NULL);
     expiry_waiters.push_back(c);
+  }
+
+  // Parallel sharding POC: every field below is GLOBALLY shared across
+  // ALL subvolumes (there is one "current" LogSegment for the whole MDS
+  // rank), so per-subvolume locking (SubvolumeState::shard_lock /
+  // SubvolumeState::Guard, used by CDir/CInode's projection-stack choke
+  // points) does NOT protect these — subvolume A's shard_lock and
+  // subvolume B's shard_lock don't exclude each other, but both may push
+  // onto the SAME LogSegment concurrently.  A single process-wide mutex
+  // guards all of them across ALL LogSegment instances — simplest choice
+  // since e.g. item_dirty.remove_myself() doesn't know which segment (and
+  // thus which per-segment mutex) an object currently belongs to.
+  static inline std::mutex g_elist_mtx;
+
+  void mark_dirty_inode(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    dirty_inodes.push_back(&in->item_dirty);
+  }
+  static void unmark_dirty_inode(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    in->item_dirty.remove_myself();
+  }
+  void add_touched_session(const entity_name_t &n) {
+    std::lock_guard l(g_elist_mtx);
+    touched_sessions.insert(n);
+  }
+  void clear_touched_sessions_locked() {
+    std::lock_guard l(g_elist_mtx);
+    touched_sessions.clear();
+  }
+  template<typename F>
+  void for_each_dirty_inode_locked(F&& f) {
+    std::lock_guard l(g_elist_mtx);
+    for (auto p = dirty_inodes.begin(); !p.end(); ++p) {
+      f(*p);
+    }
+  }
+
+  void mark_dirty_dirfrag(CDir *dir) {
+    std::lock_guard l(g_elist_mtx);
+    dirty_dirfrags.push_back(&dir->item_dirty);
+  }
+  static void unmark_dirty_dirfrag(CDir *dir) {
+    std::lock_guard l(g_elist_mtx);
+    dir->item_dirty.remove_myself();
+  }
+  void mark_new_dirfrag(CDir *dir) {
+    std::lock_guard l(g_elist_mtx);
+    new_dirfrags.push_back(&dir->item_new);
+  }
+  static void unmark_new_dirfrag(CDir *dir) {
+    std::lock_guard l(g_elist_mtx);
+    dir->item_new.remove_myself();
+  }
+  void mark_dirty_dentry(CDentry *dn) {
+    std::lock_guard l(g_elist_mtx);
+    dirty_dentries.push_back(&dn->item_dirty);
+  }
+  static void unmark_dirty_dentry(CDentry *dn) {
+    std::lock_guard l(g_elist_mtx);
+    dn->item_dirty.remove_myself();
+  }
+  void mark_open_file(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    open_files.push_back(&in->item_open_file);
+  }
+  static void unmark_open_file(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    in->item_open_file.remove_myself();
+  }
+  void mark_dirty_parent_inode(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    dirty_parent_inodes.push_back(&in->item_dirty_parent);
+  }
+  static void unmark_dirty_parent_inode(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    in->item_dirty_parent.remove_myself();
+  }
+  void mark_dirty_dirfrag_dir(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    dirty_dirfrag_dir.push_back(&in->item_dirty_dirfrag_dir);
+  }
+  static void unmark_dirty_dirfrag_dir(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    in->item_dirty_dirfrag_dir.remove_myself();
+  }
+  void mark_dirty_dirfrag_nest(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    dirty_dirfrag_nest.push_back(&in->item_dirty_dirfrag_nest);
+  }
+  static void unmark_dirty_dirfrag_nest(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    in->item_dirty_dirfrag_nest.remove_myself();
+  }
+  void mark_dirty_dirfrag_dirfragtree(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    dirty_dirfrag_dirfragtree.push_back(&in->item_dirty_dirfrag_dirfragtree);
+  }
+  static void unmark_dirty_dirfrag_dirfragtree(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    in->item_dirty_dirfrag_dirfragtree.remove_myself();
+  }
+  void insert_truncating_inode(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    truncating_inodes.insert(in);
+  }
+  void erase_truncating_inode(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    truncating_inodes.erase(in);
+  }
+  bool count_truncating_inode(CInode *in) {
+    std::lock_guard l(g_elist_mtx);
+    return truncating_inodes.count(in) != 0;
   }
 
   const seq_t seq;

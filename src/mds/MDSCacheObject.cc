@@ -86,18 +86,25 @@ void MDSCacheObject::dump_states(ceph::Formatter *f) const
 }
 
 bool MDSCacheObject::is_waiter_for(waitmask_t mask) {
+  waiting_spin_lock();
+  bool found = false;
   for ([[maybe_unused]] auto& [seq, waiter] : waiting) {
     if ((waiter.mask & mask).any()) {
-      return true;
+      found = true;
+      break;
     }
   }
-  return false;
+  waiting_spin_unlock();
+  return found;
 }
 
 void MDSCacheObject::take_waiting(waitmask_t mask, MDSContext::vec& ls) {
+  waiting_spin_lock();
   if (waiting.empty()) {
+    waiting_spin_unlock();
     return;
   }
+  bool became_empty = false;
   for (auto it = waiting.begin(); it != waiting.end(); ) {
     auto& waiter = it->second;
     if ((waiter.mask & mask).any()) {
@@ -108,9 +115,13 @@ void MDSCacheObject::take_waiting(waitmask_t mask, MDSContext::vec& ls) {
     }
   }
   if (waiting.empty()) {
-    put(PIN_WAITER);
+    became_empty = true;
     waiting.clear(); // free internal map
+  }
+  waiting_spin_unlock();
+  if (became_empty) {
+    put(PIN_WAITER);
   }
 }
 
-uint64_t MDSCacheObject::last_wait_seq = 0;
+std::atomic<uint64_t> MDSCacheObject::last_wait_seq{0};

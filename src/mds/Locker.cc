@@ -2670,10 +2670,13 @@ int Locker::issue_caps(CInode *in, Capability *only_cap)
       int op = (before & ~after) ? CEPH_CAP_OP_REVOKE : CEPH_CAP_OP_GRANT;
       if (op == CEPH_CAP_OP_REVOKE) {
 	if (mds->logger) mds->logger->inc(l_mdss_ceph_cap_op_revoke);
-	revoking_caps.push_back(&cap->item_revoking_caps);
-	auto em = revoking_caps_by_client.emplace(cap->get_client(),
-						  member_offset(Capability, item_client_revoking_caps));
-	em.first->second.push_back(&cap->item_client_revoking_caps);
+	{
+	  std::lock_guard rl(revoking_caps_mtx);
+	  revoking_caps.push_back(&cap->item_revoking_caps);
+	  auto em = revoking_caps_by_client.emplace(cap->get_client(),
+						    member_offset(Capability, item_client_revoking_caps));
+	  em.first->second.push_back(&cap->item_client_revoking_caps);
+	}
 	cap->set_last_revoke_stamp(ceph_clock_now());
 	cap->reset_num_revoke_warnings();
       } else {
@@ -3317,6 +3320,7 @@ void Locker::mark_need_snapflush_inode(CInode *in)
 
 bool Locker::is_revoking_any_caps_from(client_t client)
 {
+  std::lock_guard rl(revoking_caps_mtx);
   auto it = revoking_caps_by_client.find(client);
   if (it == revoking_caps_by_client.end())
     return false;
@@ -3436,7 +3440,7 @@ void Locker::handle_client_caps(const cref_t<MClientCaps> &m)
   // "oldest flush tid" > 0 means client uses unique TID for each flush
   if (m->get_oldest_flush_tid() > 0 && session) {
     if (session->trim_completed_flushes(m->get_oldest_flush_tid())) {
-      mds->mdlog->get_current_segment()->touched_sessions.insert(session->info.inst.name);
+      mds->mdlog->get_current_segment()->add_touched_session(session->info.inst.name);
 
       if (session->get_num_trim_flushes_warnings() > 0 &&
 	  session->get_num_completed_flushes() * 2 < g_conf()->mds_max_completed_flushes)
@@ -4372,6 +4376,7 @@ std::set<client_t> Locker::get_late_revoking_clients(double timeout)
     return now - (*p)->get_last_revoke_stamp() > timeout;
   };
 
+  std::lock_guard rl(revoking_caps_mtx);
   std::set<client_t> result;
   if (!any_late_revoking(revoking_caps)) {
     // Fast path: no misbehaving clients, execute in O(1)
@@ -4421,6 +4426,7 @@ void Locker::caps_tick()
 
   now = ceph_clock_now();
   int n = 0;
+  std::lock_guard rl(revoking_caps_mtx);
   for (auto p = revoking_caps.begin(); !p.end(); ++p) {
     Capability *cap = *p;
 
@@ -5241,9 +5247,29 @@ public:
   }
 };
 
+namespace {
+bool parallel_poc_skip_main_thread_subvolume_scatter(MDSRank *mds, CInode *in)
+{
+  // Main-thread scatter_tick must not touch subvolume inodes while shard
+  // workers hold shard_lock — tick runs under mds_lock and project_inode
+  // takes Guard(shard_lock).  Shard workers handle cap-flush scatters.
+  if (mds->is_shard_dispatch_active() ||
+      !mds->subvolume_parallel_poc_enabled()) {
+    return false;
+  }
+  inodeno_t sv = in->get_subvolume_id();
+  return sv && mds->get_subvolume_state(sv);
+}
+} // anonymous namespace
+
 void Locker::scatter_writebehind(ScatterLock *lock)
 {
   CInode *in = static_cast<CInode*>(lock->get_parent());
+  if (parallel_poc_skip_main_thread_subvolume_scatter(mds, in)) {
+    dout(10) << "scatter_writebehind deferred (parallel POC subvolume) on "
+             << *in << dendl;
+    return;
+  }
   dout(10) << "scatter_writebehind " << in->get_inode()->mtime << " on " << *lock << " on " << *in << dendl;
 
   // journal
@@ -5388,6 +5414,16 @@ void Locker::mark_updated_scatterlock(ScatterLock *lock)
 void Locker::scatter_nudge(ScatterLock *lock, MDSContext *c, bool forcelockchange)
 {
   CInode *p = static_cast<CInode *>(lock->get_parent());
+
+  if (parallel_poc_skip_main_thread_subvolume_scatter(mds, p)) {
+    dout(10) << "scatter_nudge deferred (parallel POC subvolume) on "
+             << *p << dendl;
+    if (c)
+      lock->add_waiter(SimpleLock::WAIT_STABLE, c);
+    else if (lock->is_dirty())
+      updated_scatterlocks.push_back(lock->get_updated_item());
+    return;
+  }
 
   if (p->is_frozen() || p->is_freezing()) {
     dout(10) << "scatter_nudge waiting for unfreeze on " << *p << dendl;

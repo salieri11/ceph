@@ -1,7 +1,9 @@
 #ifndef CEPH_MDSCACHEOBJECT_H
 #define CEPH_MDSCACHEOBJECT_H
 
+#include <atomic>
 #include <bitset>
+#include <mutex>
 #include <ostream>
 #include <string_view>
 
@@ -135,19 +137,31 @@ class MDSCacheObject {
     ceph_assert(ref > 0);
   }
   virtual void _put() {}
+  // ref/ref_map bookkeeping is touched from shard worker threads under the
+  // parallel sharding POC, so guard the whole critical section with a
+  // mutex rather than relying on `ref` alone being atomic (ref_map itself
+  // is a plain flat_map, not thread-safe). A real mutex (not a busy-wait
+  // spinlock) is used deliberately: under CPU oversubscription (many
+  // shard worker threads vs. few vCPUs), a spinning thread can prevent
+  // the actual lock holder from being scheduled, which starves the MDS
+  // heartbeat/tick thread and trips the internal lockup detector.
   void put(int by) {
+    ref_mutex_.lock();
 #ifdef MDS_REF_SET
     if (ref == 0 || ref_map[by] == 0) {
 #else
     if (ref == 0) {
 #endif
+      ref_mutex_.unlock();
       bad_put(by);
     } else {
       ref--;
 #ifdef MDS_REF_SET
       ref_map[by]--;
 #endif
-      if (ref == 0)
+      bool became_zero = (ref == 0);
+      ref_mutex_.unlock();
+      if (became_zero)
 	last_put();
       if (state_test(STATE_NOTIFYREF))
 	_put();
@@ -162,14 +176,17 @@ class MDSCacheObject {
     ceph_abort();
   }
   void get(int by) {
-    if (ref == 0)
-      first_get();
+    ref_mutex_.lock();
+    bool was_zero = (ref == 0);
     ref++;
 #ifdef MDS_REF_SET
     if (ref_map.find(by) == ref_map.end())
       ref_map[by] = 0;
     ref_map[by]++;
 #endif
+    ref_mutex_.unlock();
+    if (was_zero)
+      first_get();
   }
 
   void print_pin_set(std::ostream& out) const {
@@ -264,7 +281,17 @@ class MDSCacheObject {
   virtual void add_waiter(uint64_t mask, MDSContext *c) {
     add_waiter(waitmask_t(mask), c);
   }
+  // waiting_mutex_ guards `waiting` — shard worker threads calling
+  // add_waiter()/take_waiting() (contended rdlock retry) can race with
+  // the mds_lock-holding thread doing the same on the same cache object.
+  void waiting_spin_lock() const {
+    waiting_mutex_.lock();
+  }
+  void waiting_spin_unlock() const {
+    waiting_mutex_.unlock();
+  }
   void add_waiter(waitmask_t mask, MDSContext *c) {
+    waiting_spin_lock();
     if (waiting.empty())
       get(PIN_WAITER);
 
@@ -277,6 +304,7 @@ class MDSCacheObject {
       seq = 0;
     }
     waiting.insert(std::pair<waiter_seq_t, waiter>(seq, waiter{mask, c}));
+    waiting_spin_unlock();
   }
   virtual void take_waiting(uint64_t mask, std::vector<MDSContext*>& ls) {
     take_waiting(waitmask_t(mask), ls);
@@ -309,10 +337,14 @@ class MDSCacheObject {
   __u32 state = 0;     // state bits
 
   // pins
-  __s32      ref = 0;       // reference count
+  __s32 ref = 0;       // reference count
 #ifdef MDS_REF_SET
   mempool::mds_co::flat_map<int,int> ref_map;
 #endif
+  // Mutex guarding ref/ref_map — needed because shard worker threads
+  // (parallel sharding POC) may get()/put() the same cache object
+  // concurrently with the mds_lock-holding thread or another shard.
+  std::mutex ref_mutex_;
 
   int auth_pins = 0;
 #ifdef MDS_AUTHPIN_SET
@@ -332,7 +364,8 @@ class MDSCacheObject {
     MDSContext* c;
   };
   mempool::mds_co::compact_multimap<waiter_seq_t, struct waiter> waiting;
-  static waiter_seq_t last_wait_seq;
+  mutable std::mutex waiting_mutex_;
+  static std::atomic<waiter_seq_t> last_wait_seq;
 };
 
 inline std::ostream& operator<<(std::ostream& out, const mdsco_db_line_prefix& o) {

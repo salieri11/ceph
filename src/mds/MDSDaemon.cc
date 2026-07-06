@@ -1044,6 +1044,29 @@ void MDSDaemon::respawn()
 Dispatcher::dispatch_result_t MDSDaemon::ms_dispatch2(const ref_t<Message> &m)
 {
   dout(25) << __func__ << ": processing " << m << dendl;
+
+  if (mds_rank && g_conf()->mds_subvolume_sharding_parallel_poc) {
+    std::lock_guard l(mds_lock);
+    if (stopping) {
+      return false;
+    }
+
+    if (beacon.get_want_state() == CEPH_MDS_STATE_DNE) {
+      dout(10) << " stopping, discarding " << *m << dendl;
+      return true;
+    }
+
+    if (handle_core_message(m)) {
+      return true;
+    }
+
+    if (mds_rank->try_enqueue_shardable_client_request(m)) {
+      return true;
+    }
+
+    return mds_rank->ms_dispatch(m);
+  }
+
   std::lock_guard l(mds_lock);
   if (stopping) {
     return false;

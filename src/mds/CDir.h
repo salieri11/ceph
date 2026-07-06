@@ -348,6 +348,11 @@ public:
 
   CInode *get_inode()    { return inode; }
   const CInode *get_inode() const { return inode; }
+
+  // Phase 6: which subvolume (if any) this dirfrag's contents belong to —
+  // used by the projection-stack choke-point locking (project_fnode/
+  // pre_dirty/mark_dirty/pop_and_dirty_projected_fnode).
+  inodeno_t get_subvolume_id() const;
   CDir *get_parent_dir() { return inode->get_parent_dir(); }
 
   dentry_key_map::iterator begin() { return items.begin(); }

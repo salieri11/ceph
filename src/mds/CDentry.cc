@@ -228,6 +228,8 @@ void CDentry::add_waiter(uint64_t tag, MDSContext *c)
 
 version_t CDentry::pre_dirty(version_t min)
 {
+  SubvolumeState::Guard shard_guard(
+    dir->mdcache->mds->get_subvolume_state(dir->get_subvolume_id()));
   projected_version = dir->pre_dirty(min);
   dout(10) << __func__ << " " << *this << dendl;
   return projected_version;
@@ -236,6 +238,8 @@ version_t CDentry::pre_dirty(version_t min)
 
 void CDentry::_mark_dirty(LogSegmentRef const& ls)
 {
+  SubvolumeState::Guard shard_guard(
+    dir->mdcache->mds->get_subvolume_state(dir->get_subvolume_id()));
   // state+pin
   if (!state_test(STATE_DIRTY)) {
     state_set(STATE_DIRTY);
@@ -245,11 +249,13 @@ void CDentry::_mark_dirty(LogSegmentRef const& ls)
     ceph_assert(ls);
   }
   if (ls) 
-    ls->dirty_dentries.push_back(&item_dirty);
+    ls->mark_dirty_dentry(this);
 }
 
 void CDentry::mark_dirty(version_t pv, LogSegmentRef const& ls) 
 {
+  SubvolumeState::Guard shard_guard(
+    dir->mdcache->mds->get_subvolume_state(dir->get_subvolume_id()));
   dout(10) << __func__ << " " << *this << dendl;
 
   // i now live in this new dir version
@@ -274,7 +280,7 @@ void CDentry::mark_clean()
   dir->dec_num_dirty();
 
   item_dir_dirty.remove_myself();
-  item_dirty.remove_myself();
+  LogSegment::unmark_dirty_dentry(this);
 
   put(PIN_DIRTY);
 }

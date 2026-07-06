@@ -17,6 +17,7 @@
 #define MDS_RANK_H_
 
 #include <atomic>
+#include <shared_mutex>
 #include <string_view>
 
 #include "common/admin_socket.h" // for asok_finisher
@@ -185,7 +186,7 @@ class MDSRank {
       int incarnation = 0;
 
       // ── Dispatch queues ───────────────────────────────────────────
-      int dispatch_depth = 0;
+      // dispatch_depth moved to thread_local (see MDSRank.cc) for shard safety
       std::deque<MDSContext*> finished_queue;
       std::list<cref_t<Message>> waiting_for_nolaggy;
 
@@ -321,23 +322,33 @@ class MDSRank {
 
     void update_mlogger();
 
+    // finished_queue_mtx guards ls_.finished_queue specifically (separate
+    // from mds_lock) because shard worker threads processing read-only
+    // requests can reach queue_waiter()/queue_waiters() (lock-wait retry,
+    // request cleanup) concurrently with the mds_lock-holding thread's own
+    // _advance_queues() drain.
+    mutable ceph::fair_mutex finished_queue_mtx{"MDSRank::finished_queue_mtx"};
     void queue_waiter(MDSContext *c) {
+      std::lock_guard l(finished_queue_mtx);
       ls_.finished_queue.push_back(c);
       progress_thread.signal();
     }
     void queue_waiter_front(MDSContext *c) {
+      std::lock_guard l(finished_queue_mtx);
       ls_.finished_queue.push_front(c);
       progress_thread.signal();
     }
     void queue_waiters(std::vector<MDSContext*>& waiters) {
       std::vector<MDSContext*> v;
       v.swap(waiters);
+      std::lock_guard l(finished_queue_mtx);
       std::copy(v.begin(), v.end(), std::back_inserter(ls_.finished_queue));
       progress_thread.signal();
     }
     void queue_waiters_front(std::vector<MDSContext*>& waiters) {
       std::vector<MDSContext*> v;
       v.swap(waiters);
+      std::lock_guard l(finished_queue_mtx);
       std::copy(v.rbegin(), v.rend(), std::front_inserter(ls_.finished_queue));
       progress_thread.signal();
     }
@@ -480,28 +491,69 @@ class MDSRank {
     void deregister_subvolume(inodeno_t subvol_ino);
     void populate_subvolume_registry();
     ClientRequestClassification classify_client_request(const cref_t<Message> &m);
+    ClientRequestClassification classify_cap_message(const cref_t<Message> &m);
     void record_client_request_sharding(const cref_t<Message> &m);
-    const std::map<inodeno_t, SubvolumeState>& get_subvolume_states() const {
+    const auto& get_subvolume_states() const {
+      std::shared_lock l(subvolume_states_mtx_);
       return subvolume_states_;
     }
     bool could_drop_mds_lock(const ClientRequestClassification &c) const {
-      return c.cls == ShardingClass::Shardable &&
-             c.subvol_ino && subvolume_states_.count(c.subvol_ino);
+      if (c.cls != ShardingClass::Shardable || !c.subvol_ino) {
+        return false;
+      }
+      // Only ops that can run their full dispatch without ever taking
+      // mds_lock may be enqueued to a shard worker.  UNLINK/RENAME/etc.
+      // are classified Shardable for routing telemetry but must stay on
+      // the main thread — otherwise the worker holds shard_lock and
+      // blocks trying to nest mds_lock while tick/scatter_tick holds
+      // mds_lock and waits for that shard_lock (deadlock).
+      if (!c.read_only && !c.write_lockfree) {
+        return false;
+      }
+      std::shared_lock l(subvolume_states_mtx_);
+      return subvolume_states_.count(c.subvol_ino) != 0;
     }
+
+    // Phase 6: choke-point lookup used by CDir/CInode's projection-stack
+    // functions (project_fnode/project_inode/pre_dirty/mark_dirty/
+    // pop_and_dirty_projected_*) to resolve "which subvolume does this
+    // object belong to" -> SubvolumeState* for locking purposes.  Called
+    // far more often (every projection touch) than register/deregister,
+    // so subvolume_states_ needs its own shared_mutex independent of
+    // mds_lock/shard_lock (those functions run under EITHER, or neither).
+    SubvolumeState* get_subvolume_state(inodeno_t subvol_ino) const {
+      if (!subvol_ino) {
+        return nullptr;
+      }
+      std::shared_lock l(subvolume_states_mtx_);
+      auto it = subvolume_states_.find(subvol_ino);
+      return it != subvolume_states_.end() ? it->second.get() : nullptr;
+    }
+
+    // Parallel sharding POC: per-subvolume workers + shard_lock.
+    bool subvolume_parallel_poc_enabled() const;
+    bool try_enqueue_shardable_client_request(const ref_t<Message> &m);
+    void dispatch_on_shard(SubvolumeState *sv, const cref_t<Message> &m,
+                            bool lock_free, bool is_write);
+    void start_subvolume_workers();
+    void shutdown_subvolume_workers();
+
+    // True while the calling thread is executing a shard worker's
+    // lock-free dispatch (see dispatch_on_shard).  Public so Server.cc's
+    // journal_and_reply() can detect "I'm on a shard worker, not holding
+    // mds_lock" and route write completions through the Phase 7
+    // shard-local mechanism (finish_shard_local()) instead of the normal
+    // mds_lock-protected async completion.
+    bool is_shard_dispatch_active() const { return tl_shard_dispatch_active; }
 
     // Reference to global MDS::mds_lock, so that users of MDSRank don't
     // carry around references to the outer MDS, and we can substitute
     // a separate lock here in future potentially.
     ceph::fair_mutex &mds_lock;
 
-    // Phase 3: abstract dispatch lock check.  Today this is always mds_lock;
-    // later it may accept a per-shard lock when dispatch is bifurcated.
-    bool dispatch_mutex_is_locked_by_me() const {
-      return ceph_mutex_is_locked_by_me(mds_lock);
-    }
-    bool dispatch_mutex_is_locked() const {
-      return ceph_mutex_is_locked(mds_lock);
-    }
+    // Phase 3: dispatch lock check — mds_lock or active subvolume shard_lock.
+    bool dispatch_mutex_is_locked_by_me() const;
+    bool dispatch_mutex_is_locked() const;
 
     // Reference to global cluster log client, just to avoid initialising
     // a separate one here.
@@ -580,8 +632,12 @@ class MDSRank {
 
     ~MDSRank();
 
-    void inc_dispatch_depth() { ++ls_.dispatch_depth; }
-    void dec_dispatch_depth() { --ls_.dispatch_depth; }
+    static thread_local int tl_dispatch_depth_;
+    void inc_dispatch_depth() { ++tl_dispatch_depth_; }
+    void dec_dispatch_depth() { --tl_dispatch_depth_; }
+    int get_dispatch_depth() const { return tl_dispatch_depth_; }
+
+    static thread_local bool tl_shard_dispatch_active;
     void retry_dispatch(const cref_t<Message> &m);
     bool is_valid_message(const cref_t<Message> &m);
     void handle_message(const cref_t<Message> &m);
@@ -698,7 +754,13 @@ class MDSRank {
     MetricsHandler metrics_handler;
     std::unique_ptr<MetricAggregator> metric_aggregator;
 
-    std::map<inodeno_t, SubvolumeState> subvolume_states_;
+    // subvolume_states_mtx_ guards the MAP STRUCTURE (insert/erase/find) —
+    // NOT the SubvolumeState objects themselves, which have their own
+    // shard_lock.  Needed because get_subvolume_state() (Phase 6 choke-
+    // point lookups) is now called from many more places, concurrently
+    // with register_subvolume()/deregister_subvolume().
+    mutable std::shared_mutex subvolume_states_mtx_;
+    std::map<inodeno_t, std::unique_ptr<SubvolumeState>> subvolume_states_;
     ShardingTelemetryCollector sharding_telemetry_;
     MDSRankShardingState sharding_state_;
 

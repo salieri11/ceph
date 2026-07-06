@@ -1076,6 +1076,14 @@ options:
   - mds
   fmt_desc: The debug subtree invariants (for developers only).
   with_legacy: true
+- name: mds_subvolume_sharding_parallel_poc
+  type: bool
+  level: dev
+  default: false
+  services:
+  - mds
+  fmt_desc: POC per-subvolume dispatch workers with shard_lock (developers only).
+  with_legacy: true
 - name: mds_abort_on_newly_corrupt_dentry
   type: bool
   level: advanced
