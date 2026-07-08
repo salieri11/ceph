@@ -194,4 +194,18 @@ if(WITH_LIBCEPHFS)
   install(TARGETS ceph_test_libcephfs_fscrypt
     DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+  add_executable(ceph_ganesha_stable_bench
+    ganesha_stable_bench.cc
+  )
+  target_link_libraries(ceph_ganesha_stable_bench
+    ceph-common
+    cephfs
+    ${CMAKE_DL_LIBS}
+  )
+  if(NOT WIN32)
+    target_link_options(ceph_ganesha_stable_bench PRIVATE -Wl,--copy-dt-needed-entries)
+  endif()
+  install(TARGETS ceph_ganesha_stable_bench
+    DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 endif(WITH_LIBCEPHFS)
