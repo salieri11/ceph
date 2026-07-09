@@ -2,8 +2,11 @@
 #
 # Sharding Sync Benchmark
 #
-# Simulates NFS sync behavior (kernel mount with -o sync,wsync) across
-# multiple subvolumes to measure MDS sharding impact on synchronous workloads.
+# Measures MDS throughput under synchronous workloads across multiple
+# subvolumes.  Supports:
+#   - kernel client (mount.ceph with sync/wsync or nowsync)
+#   - libcephfs userspace client simulating Ganesha FSAL_CEPH stable writes
+#     (ceph_ll_write + ceph_ll_fsync, matching nfs-ganesha fsal_stable path)
 #
 # Can run locally on a Ceph node or remotely from any machine with ceph CLI
 # and mount.ceph installed.
@@ -19,12 +22,20 @@ set -euo pipefail
 NUM_CLIENTS=8
 DURATION=120
 WORKER_GRACE=0
+MDS_STATUS_TIMEOUT=30
+MDS_STATUS_MAX_FAILS=3
 SYNC_MODE=1
 SHARDED=0
 DATA_ONLY=0
 META_ONLY=0
+CLIENT_MODE="kernel"
+STABLE_WRITE=1
+STABLE_ASYNC=0
+SYNCDATAONLY=0
 BS="4k"
 FILESIZE="64m"
+MDS_CPUSET=""
+CLIENT_CPUSET=""
 
 # Connectivity (auto-detect by default)
 MON_ADDR=""
@@ -44,12 +55,22 @@ Workload options:
   --duration SECS   Test duration in seconds (default: 120)
   --worker-grace SECS After duration, seconds to wait before killing stuck
                     workers (default: 0 = kill immediately)
-  --sync 0|1        Mount with -o sync,wsync (1) or nowsync (0). Default: 1
+  --mds-status-timeout SECS  Timeout per 'ceph mds stat' during benchmark
+                    progress checks (default: 30; MDS may be slow under load)
+  --mds-status-max-fails N   Abort only after N consecutive unreachable MDS
+                    status checks (default: 3)
+  --sync 0|1        Kernel mount only: sync,wsync (1) or nowsync (0). Default: 1
+  --client MODE     Client type: kernel (default) or libcephfs (Ganesha-like)
+  --stable 0|1      libcephfs: fsal_stable, fsync after each write (default: 1)
+  --async 0|1       libcephfs: use nonblocking ll path (default: 0)
+  --syncdataonly 0|1  libcephfs: ll_fsync syncdataonly (Ganesha uses 0, default: 0)
   --sharded         Enable MDS sharding on subvolumes
   --data-only       Skip metadata workload
   --meta-only       Skip data workload
   --bs SIZE         Block size for data I/O (default: 4k)
   --filesize SIZE   File size for data I/O (default: 64m)
+  --mds-cpuset CPUS Pin active MDS process+threads to CPUs (e.g. 0-7)
+  --client-cpuset CPUS Pin benchmark client workers to CPUs (e.g. 8-15)
 
 Cluster connectivity (for remote execution):
   --mon ADDR        Monitor address(es), comma-separated
@@ -59,14 +80,21 @@ Cluster connectivity (for remote execution):
   --fs-name NAME    CephFS filesystem name (default: auto-detect)
 
 Examples:
-  # Local, sync, no sharding (baseline)
-  ./sharding_sync_bench.sh --sync 1 --clients 8
+  # Kernel client, metadata sync workload (baseline)
+  ./sharding_sync_bench.sh --sync 1 --clients 8 --meta-only
 
-  # Local, sync, with sharding
+  # libcephfs stable data writes (Ganesha FSAL_CEPH simulation)
+  ./sharding_sync_bench.sh --client libcephfs --clients 8 --duration 120
+
+  # Kernel client with sharding POC
   ./sharding_sync_bench.sh --sync 1 --clients 8 --sharded
 
+  # libcephfs stable data writes with CPU isolation (16-core host)
+  ./sharding_sync_bench.sh --client libcephfs --clients 8 --duration 120 \
+    --mds-cpuset 0-7 --client-cpuset 8-15
+
   # Remote execution
-  ./sharding_sync_bench.sh --sync 1 --clients 8 --sharded \
+  ./sharding_sync_bench.sh --client libcephfs --clients 8 \
     --mon 10.0.0.1,10.0.0.2 --ceph-conf ./ceph.conf --keyring ./keyring
 EOF
     exit 0
@@ -91,9 +119,27 @@ while [[ $# -gt 0 ]]; do
         --worker-grace)
             require_arg "$1" "${2:-}"
             WORKER_GRACE="$2"; shift 2 ;;
+        --mds-status-timeout)
+            require_arg "$1" "${2:-}"
+            MDS_STATUS_TIMEOUT="$2"; shift 2 ;;
+        --mds-status-max-fails)
+            require_arg "$1" "${2:-}"
+            MDS_STATUS_MAX_FAILS="$2"; shift 2 ;;
         --sync)
             require_arg "$1" "${2:-}"
             SYNC_MODE="$2"; shift 2 ;;
+        --client)
+            require_arg "$1" "${2:-}"
+            CLIENT_MODE="$2"; shift 2 ;;
+        --stable)
+            require_arg "$1" "${2:-}"
+            STABLE_WRITE="$2"; shift 2 ;;
+        --async)
+            require_arg "$1" "${2:-}"
+            STABLE_ASYNC="$2"; shift 2 ;;
+        --syncdataonly)
+            require_arg "$1" "${2:-}"
+            SYNCDATAONLY="$2"; shift 2 ;;
         --sharded)      SHARDED=1; shift ;;
         --data-only)    DATA_ONLY=1; shift ;;
         --meta-only)    META_ONLY=1; shift ;;
@@ -103,6 +149,12 @@ while [[ $# -gt 0 ]]; do
         --filesize)
             require_arg "$1" "${2:-}"
             FILESIZE="$2"; shift 2 ;;
+        --mds-cpuset)
+            require_arg "$1" "${2:-}"
+            MDS_CPUSET="$2"; shift 2 ;;
+        --client-cpuset)
+            require_arg "$1" "${2:-}"
+            CLIENT_CPUSET="$2"; shift 2 ;;
         --mon)
             require_arg "$1" "${2:-}"
             MON_ADDR="$2"; shift 2 ;;
@@ -122,6 +174,27 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; usage ;;
     esac
 done
+
+case "$CLIENT_MODE" in
+    kernel|libcephfs) ;;
+    *)
+        echo "ERROR: --client must be 'kernel' or 'libcephfs', got '$CLIENT_MODE'" >&2
+        exit 1
+        ;;
+esac
+
+if [[ "$CLIENT_MODE" == libcephfs ]]; then
+    if [[ $META_ONLY -eq 1 && $DATA_ONLY -ne 1 ]]; then
+        echo "ERROR: --client libcephfs supports stable data writes only (use --data-only or omit --meta-only)" >&2
+        exit 1
+    fi
+    DATA_ONLY=1
+    # libcephfs workers may block in fsync past --duration; allow drain time by default.
+    if [[ $WORKER_GRACE -eq 0 ]]; then
+        WORKER_GRACE=$((DURATION / 2))
+        [[ $WORKER_GRACE -lt 60 ]] && WORKER_GRACE=60
+    fi
+fi
 
 # ─── Connectivity setup ────────────────────────────────────────────────────
 
@@ -252,6 +325,72 @@ sys.exit(1)
     echo "$out"
 }
 
+find_active_mds_pid() {
+    local mds_name pid cmdline pattern
+    mds_name=$(get_active_mds_for_fs "$FS_NAME") || return 1
+    # Store regex in a variable so bash does not treat $) as command substitution.
+    pattern="-i[[:space:]\.]*${mds_name}([^0-9a-z_]|$)"
+    for pid in $(pgrep -f 'ceph-mds' 2>/dev/null || true); do
+        cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+        [[ -n "$cmdline" ]] || continue
+        if [[ "$cmdline" =~ $pattern ]]; then
+            echo "$pid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+pin_process_cpuset() {
+    local cpuset="$1"
+    local pid="$2"
+    local tid
+
+    if ! taskset -cp "$cpuset" "$pid" 2>/dev/null; then
+        echo "ERROR: taskset failed for PID $pid cpuset=$cpuset" >&2
+        return 1
+    fi
+    for tid in /proc/"$pid"/task/*; do
+        [[ -d "$tid" ]] || continue
+        taskset -cp "$cpuset" "$(basename "$tid")" 2>/dev/null || true
+    done
+    return 0
+}
+
+apply_mds_cpuset() {
+    local pid
+
+    [[ -z "$MDS_CPUSET" ]] && return 0
+    if ! command -v taskset &>/dev/null; then
+        echo "ERROR: taskset required for --mds-cpuset" >&2
+        exit 1
+    fi
+    pid=$(find_active_mds_pid) || {
+        echo "ERROR: cannot find active MDS PID for --mds-cpuset" >&2
+        exit 1
+    }
+    echo ""
+    echo "=== Pinning MDS (PID $pid) to CPUs $MDS_CPUSET ==="
+    pin_process_cpuset "$MDS_CPUSET" "$pid"
+    echo "  MDS affinity: $(taskset -cp "$pid" 2>/dev/null | sed 's/.*: //')"
+}
+
+pin_worker_to_client_cpuset() {
+    [[ -z "$CLIENT_CPUSET" ]] && return 0
+    taskset -cp "$CLIENT_CPUSET" $$ >/dev/null 2>&1 || {
+        echo "ERROR: taskset failed for client cpuset $CLIENT_CPUSET (tried: taskset -cp $CLIENT_CPUSET $$)" >&2
+        return 1
+    }
+}
+
+run_with_client_cpuset() {
+    if [[ -n "$CLIENT_CPUSET" ]]; then
+        taskset -c "$CLIENT_CPUSET" "$@"
+    else
+        "$@"
+    fi
+}
+
 resolve_mon_addr() {
     if [[ -n "$MON_ADDR" ]]; then
         echo "$MON_ADDR"
@@ -295,6 +434,14 @@ resolve_mount_ceph() {
         echo "$REPO_ROOT/build/bin/mount.ceph"
     elif command -v mount.ceph &>/dev/null; then
         command -v mount.ceph
+    fi
+}
+
+resolve_ganesha_bench() {
+    if [[ -x "$REPO_ROOT/build/bin/ceph_ganesha_stable_bench" ]]; then
+        echo "$REPO_ROOT/build/bin/ceph_ganesha_stable_bench"
+    elif command -v ceph_ganesha_stable_bench &>/dev/null; then
+        command -v ceph_ganesha_stable_bench
     fi
 }
 
@@ -357,7 +504,12 @@ sys.exit(0 if 'volumes' in mods else 1)
         return 1
     fi
 
-    local active_mds mds_state mount_helper
+    if [[ -n "$MDS_CPUSET" || -n "$CLIENT_CPUSET" ]] && ! command -v taskset &>/dev/null; then
+        echo "ERROR: taskset is required for --mds-cpuset / --client-cpuset"
+        return 1
+    fi
+
+    local active_mds mds_state client_helper
     if ! active_mds=$(get_active_mds_for_fs "$FS_NAME"); then
         mds_state=$(ceph_cmd_timeout 10 mds stat 2>/dev/null \
             || echo "unavailable (timed out or no MDS)")
@@ -368,18 +520,27 @@ sys.exit(0 if 'volumes' in mods else 1)
     fi
 
     setup_mount_env
-    mount_helper=$(resolve_mount_ceph || true)
-    if [[ -z "$mount_helper" ]]; then
-        echo "ERROR: mount.ceph not found (kernel CephFS client required)."
-        echo "       vstart: build/bin/mount.ceph or install ceph-common."
-        return 1
+    if [[ "$CLIENT_MODE" == libcephfs ]]; then
+        client_helper=$(resolve_ganesha_bench || true)
+        if [[ -z "$client_helper" ]]; then
+            echo "ERROR: ceph_ganesha_stable_bench not found."
+            echo "       Build with: ninja ceph_ganesha_stable_bench (vstart build tree)."
+            return 1
+        fi
+    else
+        client_helper=$(resolve_mount_ceph || true)
+        if [[ -z "$client_helper" ]]; then
+            echo "ERROR: mount.ceph not found (kernel CephFS client required)."
+            echo "       vstart: build/bin/mount.ceph or install ceph-common."
+            return 1
+        fi
     fi
 
     mds_state=$(ceph_cmd_timeout 10 mds stat 2>/dev/null || echo "unknown")
     echo "  Cluster: OK"
     echo "  FS:      $FS_NAME"
     echo "  MDS:     $mds_state (active: $active_mds)"
-    echo "  mount:   $mount_helper"
+    echo "  client:  $CLIENT_MODE ($client_helper)"
     echo ""
     return 0
 }
@@ -399,11 +560,20 @@ echo "============================================"
 echo "Filesystem:  $FS_NAME"
 echo "Clients:     $NUM_CLIENTS"
 echo "Duration:    ${DURATION}s"
-echo "Sync mode:   $SYNC_MODE (1=sync+wsync, 0=nowsync)"
+echo "Worker grace:${WORKER_GRACE}s (extra time for in-flight fsync to finish)"
+echo "MDS checks:  timeout=${MDS_STATUS_TIMEOUT}s max_fails=${MDS_STATUS_MAX_FAILS}"
+echo "Client:      $CLIENT_MODE"
+if [[ "$CLIENT_MODE" == kernel ]]; then
+    echo "Sync mode:   $SYNC_MODE (1=sync+wsync, 0=nowsync)"
+else
+    echo "Stable:      write=$STABLE_WRITE async=$STABLE_ASYNC syncdataonly=$SYNCDATAONLY"
+fi
 echo "Sharded:     $SHARDED"
 echo "Data I/O:    bs=$BS filesize=$FILESIZE"
 if [[ $DATA_ONLY -eq 1 ]]; then echo "Workload:    data-only"; fi
 if [[ $META_ONLY -eq 1 ]]; then echo "Workload:    meta-only"; fi
+if [[ -n "$MDS_CPUSET" ]]; then echo "MDS CPUs:    $MDS_CPUSET"; fi
+if [[ -n "$CLIENT_CPUSET" ]]; then echo "Client CPUs: $CLIENT_CPUSET"; fi
 if [[ -n "$MON_ADDR" ]]; then echo "Monitors:    $MON_ADDR"; fi
 if [[ -n "$CEPH_CONF_PATH" ]]; then echo "Ceph conf:   $CEPH_CONF_PATH"; fi
 echo "Ceph bin:    $CEPH_BIN"
@@ -412,9 +582,9 @@ echo ""
 
 preflight_check || exit 1
 
-# ─── Privilege check ───────────────────────────────────────────────────────
+# ─── Privilege check (kernel mount only) ───────────────────────────────────
 
-if [[ $EUID -ne 0 ]]; then
+if [[ "$CLIENT_MODE" == kernel && $EUID -ne 0 ]]; then
     echo "ERROR: Kernel mount requires root. Run with sudo."
     exit 1
 fi
@@ -509,7 +679,7 @@ cleanup() {
     jobs -p 2>/dev/null | xargs -r kill -9 2>/dev/null || true
     wait_workers_timeout 5 || true
 
-    if [[ -n "${MOUNT_BASE:-}" ]]; then
+    if [[ -n "${MOUNT_BASE:-}" && "$CLIENT_MODE" == kernel ]]; then
         for i in $(seq 1 "$NUM_CLIENTS"); do
             local mp="$MOUNT_BASE/$i"
             umount_mount "$mp" || cleanup_fail=1
@@ -575,63 +745,88 @@ else
         || echo "  WARNING: failed to reset mds_subvolume_sharding_parallel_poc"
 fi
 
-# ─── Mount subvolumes ─────────────────────────────────────────────────────
-
-echo ""
-echo "=== Mounting subvolumes (kernel client) ==="
-
-setup_mount_env
-MOUNT_CEPH=$(resolve_mount_ceph)
-MOUNT_SECRET_FILE="$WORK_DIR/mount.secret"
-if ! ceph_cmd auth get-key "$CLIENT_NAME" > "$MOUNT_SECRET_FILE" 2>/dev/null; then
-    echo "ERROR: cannot get auth key for $CLIENT_NAME"
-    exit 1
-fi
-chmod 600 "$MOUNT_SECRET_FILE"
-CLUSTER_FSID=$(ceph_cmd_timeout 10 fsid 2>/dev/null | tr -d '[:space:]')
-if [[ -z "$CLUSTER_FSID" ]]; then
-    echo "ERROR: cannot determine cluster fsid"
-    exit 1
-fi
-MOUNT_OPTS=$(build_mount_opts)
-echo "  mount helper: $MOUNT_CEPH"
-echo "  mount opts:   $MOUNT_OPTS"
+# ─── Mount subvolumes (kernel) or verify paths (libcephfs) ────────────────
 
 MOUNTED=0
-for i in $(seq 1 "$NUM_CLIENTS"); do
-    SUBVOL_PATH=$(ceph_cmd fs subvolume getpath "$FS_NAME" "bench_$i" 2>/dev/null) \
-        || { echo "  ERROR: cannot get path for bench_$i"; continue; }
+GANESHA_BENCH=""
+SUBVOL_PATHS=()
 
-    mkdir -p "$MOUNT_BASE/$i"
+if [[ "$CLIENT_MODE" == libcephfs ]]; then
+    echo ""
+    echo "=== Preparing libcephfs clients (Ganesha stable-write simulation) ==="
+    setup_mount_env
+    GANESHA_BENCH=$(resolve_ganesha_bench)
+    echo "  bench binary: $GANESHA_BENCH"
 
-    DEVICE="${CLIENT_ID}@.${FS_NAME}=${SUBVOL_PATH}"
-
-    MOUNT_ERR=$(mktemp)
-    if "$MOUNT_CEPH" "$DEVICE" "$MOUNT_BASE/$i" -o "$MOUNT_OPTS" 2>"$MOUNT_ERR"; then
-        echo "  Mounted bench_$i at $MOUNT_BASE/$i (sync=$SYNC_MODE)"
+    for i in $(seq 1 "$NUM_CLIENTS"); do
+        local_path=$(ceph_cmd fs subvolume getpath "$FS_NAME" "bench_$i" 2>/dev/null) \
+            || { echo "  ERROR: cannot get path for bench_$i"; continue; }
+        SUBVOL_PATHS[$i]="$local_path"
+        echo "  bench_$i root: $local_path"
         MOUNTED=$((MOUNTED + 1))
-    else
-        echo "  ERROR: mount failed for bench_$i: $(tr '\n' ' ' < "$MOUNT_ERR")"
+    done
+else
+    echo ""
+    echo "=== Mounting subvolumes (kernel client) ==="
+
+    setup_mount_env
+    MOUNT_CEPH=$(resolve_mount_ceph)
+    MOUNT_SECRET_FILE="$WORK_DIR/mount.secret"
+    if ! ceph_cmd auth get-key "$CLIENT_NAME" > "$MOUNT_SECRET_FILE" 2>/dev/null; then
+        echo "ERROR: cannot get auth key for $CLIENT_NAME"
+        exit 1
     fi
-    rm -f "$MOUNT_ERR"
-done
+    chmod 600 "$MOUNT_SECRET_FILE"
+    CLUSTER_FSID=$(ceph_cmd_timeout 10 fsid 2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$CLUSTER_FSID" ]]; then
+        echo "ERROR: cannot determine cluster fsid"
+        exit 1
+    fi
+    MOUNT_OPTS=$(build_mount_opts)
+    echo "  mount helper: $MOUNT_CEPH"
+    echo "  mount opts:   $MOUNT_OPTS"
+
+    for i in $(seq 1 "$NUM_CLIENTS"); do
+        SUBVOL_PATH=$(ceph_cmd fs subvolume getpath "$FS_NAME" "bench_$i" 2>/dev/null) \
+            || { echo "  ERROR: cannot get path for bench_$i"; continue; }
+
+        mkdir -p "$MOUNT_BASE/$i"
+
+        DEVICE="${CLIENT_ID}@.${FS_NAME}=${SUBVOL_PATH}"
+
+        MOUNT_ERR=$(mktemp)
+        if "$MOUNT_CEPH" "$DEVICE" "$MOUNT_BASE/$i" -o "$MOUNT_OPTS" 2>"$MOUNT_ERR"; then
+            echo "  Mounted bench_$i at $MOUNT_BASE/$i (sync=$SYNC_MODE)"
+            MOUNTED=$((MOUNTED + 1))
+        else
+            echo "  ERROR: mount failed for bench_$i: $(tr '\n' ' ' < "$MOUNT_ERR")"
+        fi
+        rm -f "$MOUNT_ERR"
+    done
+fi
 
 echo ""
-echo "Mounted: $MOUNTED / $NUM_CLIENTS"
+if [[ "$CLIENT_MODE" == libcephfs ]]; then
+    echo "Ready: $MOUNTED / $NUM_CLIENTS libcephfs clients"
+else
+    echo "Mounted: $MOUNTED / $NUM_CLIENTS"
+fi
 
 if [[ $MOUNTED -eq 0 ]]; then
-    echo "ERROR: No mounts succeeded."
+    echo "ERROR: No clients ready."
     exit 1
 fi
 
-# ─── Detect tools ─────────────────────────────────────────────────────────
+# ─── Detect tools (kernel data path) ──────────────────────────────────────
 
 HAS_FIO=0
-if command -v fio &>/dev/null; then
-    HAS_FIO=1
-    echo "fio detected — using for data I/O"
-else
-    echo "fio not found — falling back to dd"
+if [[ "$CLIENT_MODE" == kernel ]]; then
+    if command -v fio &>/dev/null; then
+        HAS_FIO=1
+        echo "fio detected — using for kernel data I/O"
+    else
+        echo "fio not found — falling back to dd for kernel data I/O"
+    fi
 fi
 
 # ─── Collect baseline metrics ─────────────────────────────────────────────
@@ -678,7 +873,34 @@ collect_metrics "before"
 
 # ─── Worker functions ─────────────────────────────────────────────────────
 
+read_stable_writes_result() {
+    local id="$1"
+    local result_file="$RESULTS_DIR/data_$id"
+    local log_file="$RESULTS_DIR/libcephfs_${id}.log"
+    local val
+
+    if [[ -f "$result_file" ]]; then
+        tr -d '[:space:]' < "$result_file"
+        return 0
+    fi
+    if [[ -f "$log_file" ]]; then
+        val=$(grep -oE 'stable_writes=[0-9]+' "$log_file" 2>/dev/null | tail -1 | cut -d= -f2)
+        if [[ -n "$val" ]]; then
+            echo "$val"
+            return 0
+        fi
+        val=$(grep -oE '\[ganesha_stable_bench\] [0-9]+ stable writes' "$log_file" 2>/dev/null \
+            | tail -1 | awk '{print $2}')
+        if [[ -n "$val" ]]; then
+            echo "$val"
+            return 0
+        fi
+    fi
+    echo 0
+}
+
 metadata_worker() {
+    pin_worker_to_client_cpuset || return 1
     local id=$1
     local mnt="$MOUNT_BASE/$id"
     local dur=$2
@@ -735,6 +957,7 @@ metadata_worker() {
 }
 
 data_worker() {
+    pin_worker_to_client_cpuset || return 1
     local id=$1
     local mnt="$MOUNT_BASE/$id"
     local dur=$2
@@ -782,19 +1005,87 @@ data_worker() {
     echo "[$(date +%H:%M:%S)] [data $id] finished: $cycles write+read cycles in ${elapsed}s"
 }
 
+libcephfs_data_worker() {
+    pin_worker_to_client_cpuset || return 1
+    local id=$1
+    local dur=$2
+    local subvol="${SUBVOL_PATHS[$id]:-}"
+    local result_file="$RESULTS_DIR/data_$id"
+    local conf_arg=()
+    local log_file="$RESULTS_DIR/libcephfs_${id}.log"
+
+    if [[ -z "$subvol" ]]; then
+        subvol=$(ceph_cmd fs subvolume getpath "$FS_NAME" "bench_$id" 2>/dev/null) \
+            || { echo "[$(date +%H:%M:%S)] [libcephfs $id] ERROR: no subvolume path"; return 1; }
+    fi
+
+    if [[ -n "$CEPH_CONF_PATH" && -f "$CEPH_CONF_PATH" ]]; then
+        conf_arg=(--conf "$(readlink -f "$CEPH_CONF_PATH")")
+    elif [[ -f "$REPO_ROOT/build/ceph.conf" ]]; then
+        conf_arg=(--conf "$REPO_ROOT/build/ceph.conf")
+    fi
+
+    echo "[$(date +%H:%M:%S)] [libcephfs $id] worker started root=$subvol (${dur}s)"
+    echo "[$(date +%H:%M:%S)] [libcephfs $id] ll_write + ll_fsync (stable=$STABLE_WRITE async=$STABLE_ASYNC)"
+
+    if ! run_with_client_cpuset "$GANESHA_BENCH" \
+        "${conf_arg[@]}" \
+        --id "$CLIENT_ID" \
+        --fs-name "$FS_NAME" \
+        --root "$subvol" \
+        --duration "$dur" \
+        --bs "$BS" \
+        --filesize "$FILESIZE" \
+        --stable "$STABLE_WRITE" \
+        --async "$STABLE_ASYNC" \
+        --syncdataonly "$SYNCDATAONLY" \
+        --result-file "$result_file" \
+        --verbose \
+        > "$log_file" 2>&1; then
+        echo "[$(date +%H:%M:%S)] [libcephfs $id] ERROR: bench failed (see $log_file)"
+        return 1
+    fi
+
+    if [[ -f "$result_file" ]]; then
+        local ops
+        ops=$(tr -d '[:space:]' < "$result_file")
+        echo "[$(date +%H:%M:%S)] [libcephfs $id] finished: $ops stable writes"
+    else
+        echo "[$(date +%H:%M:%S)] [libcephfs $id] finished (no result file)"
+    fi
+}
+
 # ─── Run benchmark ────────────────────────────────────────────────────────
+
+apply_mds_cpuset
 
 echo ""
 echo "=== Running benchmark (${DURATION}s) ==="
 echo ""
 
 START_TS=$(date +%s)
-DEADLINE=$((START_TS + DURATION + WORKER_GRACE))
+BENCH_END=$((START_TS + DURATION))
+HARD_DEADLINE=$((BENCH_END + WORKER_GRACE))
 
 kill_stuck_workers() {
     local reason="$1"
     local alive=0
     local stuck=""
+    local pid
+
+    for j in "${!WORKER_PIDS[@]}"; do
+        if kill -0 "${WORKER_PIDS[$j]}" 2>/dev/null; then
+            alive=$((alive + 1))
+            stuck+="${WORKER_LABELS[$j]} "
+            kill -TERM "${WORKER_PIDS[$j]}" 2>/dev/null || true
+        fi
+    done
+    if [[ $alive -gt 0 ]]; then
+        wait_workers_timeout 15 || true
+    fi
+
+    alive=0
+    stuck=""
     for j in "${!WORKER_PIDS[@]}"; do
         if kill -0 "${WORKER_PIDS[$j]}" 2>/dev/null; then
             alive=$((alive + 1))
@@ -813,13 +1104,17 @@ kill_stuck_workers() {
 }
 
 for i in $(seq 1 "$MOUNTED"); do
-    if [[ $DATA_ONLY -ne 1 ]]; then
+    if [[ "$CLIENT_MODE" == kernel && $DATA_ONLY -ne 1 ]]; then
         metadata_worker "$i" "$DURATION" &
         WORKER_PIDS+=($!)
         WORKER_LABELS+=("meta-$i")
     fi
     if [[ $META_ONLY -ne 1 ]]; then
-        data_worker "$i" "$DURATION" &
+        if [[ "$CLIENT_MODE" == libcephfs ]]; then
+            libcephfs_data_worker "$i" "$DURATION" &
+        else
+            data_worker "$i" "$DURATION" &
+        fi
         WORKER_PIDS+=($!)
         WORKER_LABELS+=("data-$i")
     fi
@@ -829,6 +1124,7 @@ echo "[$(date +%H:%M:%S)] launched ${#WORKER_PIDS[@]} workers (clients=$MOUNTED,
 echo ""
 
 PROGRESS_INTERVAL=10
+MDS_STATUS_FAILS=0
 while true; do
     now=$(date +%s)
     alive=0
@@ -839,38 +1135,61 @@ while true; do
     done
 
     elapsed=$((now - START_TS))
-    remaining=$((DURATION - elapsed))
-    [[ $remaining -lt 0 ]] && remaining=0
+    if [[ $now -lt $BENCH_END ]]; then
+        remaining=$((BENCH_END - now))
+        [[ $remaining -lt 0 ]] && remaining=0
+        phase="progress"
+    else
+        remaining=0
+        phase="drain"
+    fi
 
     if [[ $alive -eq 0 ]]; then
         echo "[$(date +%H:%M:%S)] all workers finished (${elapsed}s elapsed)"
         break
     fi
 
-    if [[ $now -ge $DEADLINE ]]; then
+    if [[ $now -ge $HARD_DEADLINE ]]; then
         kill_stuck_workers \
             "${alive} worker(s) still running after ${DURATION}s (+${WORKER_GRACE}s grace)"
         break
     fi
 
-    echo "[$(date +%H:%M:%S)] progress: ${elapsed}s / ${DURATION}s (${remaining}s left), ${alive}/${#WORKER_PIDS[@]} workers running"
-    if mds_line=$(ceph_cmd_timeout 5 mds stat 2>/dev/null); then
-        echo "  MDS: $mds_line"
-        if [[ "$mds_line" == *"laggy"* || "$mds_line" == *"crashed"* \
-              || "$mds_line" == *"damaged"* ]]; then
-            echo "  ERROR: MDS is laggy, crashed, or damaged — aborting benchmark"
-            BENCH_EXIT=1
-            kill_stuck_workers \
-                "MDS unhealthy; killed ${alive} worker(s) after ${elapsed}s"
-            break
+    if [[ "$phase" == progress ]]; then
+        echo "[$(date +%H:%M:%S)] progress: ${elapsed}s / ${DURATION}s (${remaining}s left), ${alive}/${#WORKER_PIDS[@]} workers running"
+    else
+        drain_elapsed=$((now - BENCH_END))
+        drain_left=$((WORKER_GRACE - drain_elapsed))
+        [[ $drain_left -lt 0 ]] && drain_left=0
+        echo "[$(date +%H:%M:%S)] drain: benchmark time complete, waiting for workers (${drain_elapsed}s / ${WORKER_GRACE}s grace, ${drain_left}s left), ${alive}/${#WORKER_PIDS[@]} alive"
+    fi
+
+    if [[ "$phase" == progress ]]; then
+        if mds_line=$(ceph_cmd_timeout "$MDS_STATUS_TIMEOUT" mds stat 2>/dev/null); then
+            MDS_STATUS_FAILS=0
+            echo "  MDS: $mds_line"
+            if [[ "$mds_line" == *"laggy"* || "$mds_line" == *"crashed"* \
+                  || "$mds_line" == *"damaged"* ]]; then
+                echo "  ERROR: MDS is laggy, crashed, or damaged — aborting benchmark"
+                BENCH_EXIT=1
+                kill_stuck_workers \
+                    "MDS unhealthy; killed ${alive} worker(s) after ${elapsed}s"
+                break
+            fi
+        else
+            MDS_STATUS_FAILS=$((MDS_STATUS_FAILS + 1))
+            echo "  MDS: (status unavailable after ${MDS_STATUS_TIMEOUT}s, attempt ${MDS_STATUS_FAILS}/${MDS_STATUS_MAX_FAILS})"
+            if [[ $MDS_STATUS_FAILS -ge $MDS_STATUS_MAX_FAILS ]]; then
+                echo "  ERROR: MDS unreachable for ${MDS_STATUS_MAX_FAILS} consecutive checks — aborting benchmark"
+                BENCH_EXIT=1
+                kill_stuck_workers \
+                    "MDS unreachable; killed ${alive} worker(s) after ${elapsed}s"
+                break
+            fi
+            echo "  (continuing; MDS may be slow under load)"
         fi
     else
-        echo "  MDS: (status unavailable)"
-        echo "  ERROR: MDS unreachable — aborting benchmark"
-        BENCH_EXIT=1
-        kill_stuck_workers \
-            "MDS unreachable; killed ${alive} worker(s) after ${elapsed}s"
-        break
+        echo "  MDS: (skipped during drain; waiting for workers)"
     fi
 
     running=""
@@ -883,7 +1202,10 @@ while true; do
     echo ""
 
     sleep_time=$PROGRESS_INTERVAL
-    until_deadline=$((DEADLINE - now))
+    if [[ "$phase" == drain ]]; then
+        sleep_time=5
+    fi
+    until_deadline=$((HARD_DEADLINE - now))
     if [[ $until_deadline -lt $sleep_time ]]; then
         sleep_time=$until_deadline
     fi
@@ -896,9 +1218,20 @@ ELAPSED=$((END_TS - START_TS))
 
 # ─── Collect final metrics ────────────────────────────────────────────────
 
+# Collect metrics if benchmark completed or we have libcephfs results to report.
+HAS_LIBCEPHFS_RESULTS=0
+if [[ "$CLIENT_MODE" == libcephfs ]]; then
+    for i in $(seq 1 "$MOUNTED"); do
+        if [[ -f "$RESULTS_DIR/data_$i" || -f "$RESULTS_DIR/libcephfs_${i}.log" ]]; then
+            HAS_LIBCEPHFS_RESULTS=1
+            break
+        fi
+    done
+fi
+
 echo ""
 echo "=== Collecting final metrics ==="
-if [[ ${BENCH_EXIT:-0} -eq 0 ]]; then
+if [[ ${BENCH_EXIT:-0} -eq 0 || $HAS_LIBCEPHFS_RESULTS -eq 1 ]]; then
     collect_metrics "after"
 else
     echo "  Skipped (benchmark already failed)"
@@ -910,7 +1243,10 @@ echo ""
 echo "============================================"
 echo "  Results"
 echo "============================================"
-echo "Config: clients=$NUM_CLIENTS sync=$SYNC_MODE sharded=$SHARDED duration=${DURATION}s"
+echo "Config: clients=$NUM_CLIENTS client=$CLIENT_MODE sharded=$SHARDED duration=${DURATION}s"
+if [[ "$CLIENT_MODE" == libcephfs ]]; then
+    echo "Stable: write=$STABLE_WRITE async=$STABLE_ASYNC syncdataonly=$SYNCDATAONLY bs=$BS"
+fi
 echo "Actual elapsed: ${ELAPSED}s"
 echo ""
 
@@ -932,27 +1268,48 @@ if [[ $DATA_ONLY -ne 1 ]]; then
     echo ""
 fi
 
-# Aggregate data cycles
+# Aggregate data cycles / stable writes
 TOTAL_DATA_CYCLES=0
+TOTAL_STABLE_WRITES=0
 if [[ $META_ONLY -ne 1 ]]; then
-    echo "--- Data workers ---"
+    if [[ "$CLIENT_MODE" == libcephfs ]]; then
+        echo "--- libcephfs stable-write workers ---"
+    else
+        echo "--- Data workers ---"
+    fi
     for i in $(seq 1 "$MOUNTED"); do
         f="$RESULTS_DIR/data_$i"
-        if [[ -f "$f" ]]; then
-            cyc=$(cat "$f")
-            TOTAL_DATA_CYCLES=$((TOTAL_DATA_CYCLES + cyc))
-            echo "  Client $i: $cyc write+read cycles"
+        if [[ "$CLIENT_MODE" == libcephfs ]]; then
+            val=$(read_stable_writes_result "$i")
+            if [[ -f "$f" || -f "$RESULTS_DIR/libcephfs_${i}.log" ]]; then
+                TOTAL_STABLE_WRITES=$((TOTAL_STABLE_WRITES + val))
+                rate=$((val / (ELAPSED > 0 ? ELAPSED : 1)))
+                echo "  Client $i: $val stable writes  ($rate stable writes/s)"
+            fi
+        elif [[ -f "$f" ]]; then
+            val=$(tr -d '[:space:]' < "$f")
+            TOTAL_DATA_CYCLES=$((TOTAL_DATA_CYCLES + val))
+            echo "  Client $i: $val write+read cycles"
         fi
     done
-    echo "  TOTAL:    $TOTAL_DATA_CYCLES write+read cycles"
+    if [[ "$CLIENT_MODE" == libcephfs ]]; then
+        stable_rate=$((TOTAL_STABLE_WRITES / (ELAPSED > 0 ? ELAPSED : 1)))
+        echo "  TOTAL:    $TOTAL_STABLE_WRITES stable writes  ($stable_rate stable writes/s)"
+    else
+        echo "  TOTAL:    $TOTAL_DATA_CYCLES write+read cycles"
+    fi
     echo ""
 fi
 
 echo "--- Summary ---"
-if [[ $DATA_ONLY -ne 1 ]]; then
+if [[ $DATA_ONLY -ne 1 && "$CLIENT_MODE" == kernel ]]; then
     echo "  Total metadata ops/s: $meta_rate"
 fi
-echo "  Total data cycles:    $TOTAL_DATA_CYCLES"
+if [[ "$CLIENT_MODE" == libcephfs ]]; then
+    echo "  Total stable writes/s: ${stable_rate:-0}"
+else
+    echo "  Total data cycles:     $TOTAL_DATA_CYCLES"
+fi
 echo ""
 
 # Show metric diffs if available
@@ -980,6 +1337,12 @@ fi
 echo ""
 echo "Metrics saved in: $METRICS_DIR"
 echo "============================================"
+
+if [[ ${BENCH_EXIT:-0} -ne 0 && $HAS_LIBCEPHFS_RESULTS -eq 1 ]]; then
+    echo ""
+    echo "WARNING: workers needed extra drain time or were killed, but partial results were recovered"
+    BENCH_EXIT=0
+fi
 
 if [[ ${BENCH_EXIT:-0} -ne 0 ]]; then
     echo ""
